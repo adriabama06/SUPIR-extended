@@ -1072,8 +1072,6 @@ with block:
 
             with gr.Column():
                 target_res_textbox = gr.Textbox(label="Input / Output Resolution", value="", interactive=False)
-                btn_open_outputs = gr.Button("Open Outputs Folder")
-                btn_open_outputs.click(fn=open_folder)
                 with gr.Accordion("Batch options", open=True):
                     with gr.Row():
                         with gr.Column():
