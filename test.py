@@ -3,7 +3,7 @@ import argparse
 from SUPIR.util import create_SUPIR_model, PIL2Tensor, Tensor2PIL, convert_dtype
 from PIL import Image
 from llava.llava_agent import LLavaAgent
-from CKPT_PTH import LLAVA_MODEL_PATH
+from SUPIR.CKPT_PTH import LLAVA_MODEL_PATH
 import os
 if torch.cuda.device_count() >= 2:
     SUPIR_device = 'cuda:0'

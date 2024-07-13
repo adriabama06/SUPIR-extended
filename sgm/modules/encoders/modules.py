@@ -18,7 +18,7 @@ from transformers import (
     T5Tokenizer,
 )
 
-from CKPT_PTH import SDXL_CLIP1_PATH, SDXL_CLIP2_CKPT_PTH
+from SUPIR.CKPT_PTH import SDXL_CLIP1_PATH, SDXL_CLIP2_CKPT_PTH
 from SUPIR.utils.model_fetch import get_model
 from ...modules.autoencoding.regularizers import DiagonalGaussianRegularizer
 from ...modules.diffusionmodules.model import Encoder
