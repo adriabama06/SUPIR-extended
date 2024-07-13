@@ -380,7 +380,7 @@ def load_model(selected_model, selected_checkpoint, weight_dtype, sampler='DPMPP
         torch.cuda.empty_cache()
         last_used_checkpoint = checkpoint_use
         model_cfg = "options/SUPIR_v0_tiled.yaml" if args.use_tile_vae else "options/SUPIR_v0.yaml"
-        weight_dtype = 'fp16' if bf16_supported == False else weight_dtype
+        weight_dtype = 'fp16' if not bf16_supported else weight_dtype
         model = create_SUPIR_model(model_cfg, weight_dtype, supir_sign=selected_model[-1], device=device, ckpt=checkpoint_use,
                                    sampler=sampler)
         model.current_model = selected_model

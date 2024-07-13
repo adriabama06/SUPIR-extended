@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
-from CKPT_PTH import LLAVA_CLIP_PATH
 from SUPIR.utils.model_fetch import get_model
 
 
