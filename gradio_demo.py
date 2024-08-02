@@ -41,7 +41,7 @@ from ui_helpers import is_video, extract_video, compile_video, is_image, get_vid
     read_image_metadata, submit_feedback, refresh_models_click
 from upscale.upscaler import upscale_models
 
-SUPIR_REVISION = "v49"
+SUPIR_REVISION = "v50"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--ip", type=str, default='127.0.0.1', help="IP address for the server to listen on.")
