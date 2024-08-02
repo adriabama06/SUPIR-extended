@@ -21,7 +21,6 @@ from PIL import PngImagePlugin
 from fastapi import FastAPI, BackgroundTasks
 from gradio_imageslider import ImageSlider
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import ui_helpers
 from SUPIR.models.SUPIR_model import SUPIRModel
@@ -33,12 +32,12 @@ from SUPIR.utils.compare import create_comparison_video
 from SUPIR.utils.face_restoration_helper import FaceRestoreHelper
 from SUPIR.utils.rename_meta import rename_meta_key
 from SUPIR.utils.status_container import StatusContainer, MediaData
-from caption.caption_llm import LLMCaption, MoondreamCaption
+from caption.caption_llm import MoondreamCaption
 from download_models import download_models
 from openai_prompt import prompt_prompt
 from ui_helpers import is_video, extract_video, compile_video, is_image, get_video_params, printt, refresh_styles_click, \
     select_style, open_folder, set_info_attributes, list_models, get_ckpt_path, selected_model, to_gpu, slider_html, \
-    title_md, claim_md, refresh_symbol, dl_symbol, fullscreen_symbol, default_llava_prompt, update_model_settings, \
+    title_md, claim_md, refresh_symbol, dl_symbol, fullscreen_symbol, default_llm_prompt, update_model_settings, \
     read_image_metadata, submit_feedback, refresh_models_click
 
 SUPIR_REVISION = "v49"
@@ -66,9 +65,9 @@ parser.add_argument("--encoder_tile_size", type=int, default=512,
                     help="Tile size for the encoder. Larger sizes may improve quality but require more memory.")
 parser.add_argument("--decoder_tile_size", type=int, default=64,
                     help="Tile size for the decoder. Larger sizes may improve quality but require more memory.")
-parser.add_argument("--load_8bit_llava", action='store_true', default=False,
+parser.add_argument("--load_8bit_llm", action='store_true', default=False,
                     help="Load the LLAMA model in 8-bit precision to save memory.")
-parser.add_argument("--load_4bit_llava", action='store_true', default=True,
+parser.add_argument("--load_4bit_llm", action='store_true', default=True,
                     help="Load the LLAMA model in 4-bit precision to significantly reduce memory usage.")
 parser.add_argument("--ckpt", type=str, default='Juggernaut_RunDiffusionPhoto2_Lightning_4Steps.safetensors',
                     help="Path to the checkpoint file for the model.")
@@ -113,6 +112,8 @@ if torch.cuda.is_available() and args.autotune:
     # Get total GPU memory
     total_vram = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
     print("Autotune enabled, Total VRAM: ", total_vram, "GB")
+    if total_vram < 8:
+        args.use_tile_vae = True
     if not args.fp8:
         args.fp8 = total_vram <= 8
     auto_unload = total_vram <= 12
@@ -120,8 +121,7 @@ if torch.cuda.is_available() and args.autotune:
     if total_vram <= 24:
         if not args.loading_half_params:
             args.loading_half_params = True
-        # if not args.use_tile_vae:
-        #     args.use_tile_vae = True
+
     print("Auto Unload: ", auto_unload)
     print("Half Params: ", args.loading_half_params)
     print("FP8: ", args.fp8)
@@ -147,13 +147,13 @@ if args.ckpt_dir == "models/checkpoints":
 
 if torch.cuda.device_count() >= 2:
     SUPIR_device = 'cuda:0'
-    LLaVA_device = 'cuda:1'
+    LLM_device = 'cuda:1'
 elif torch.cuda.device_count() == 1:
     SUPIR_device = 'cuda:0'
-    LLaVA_device = 'cuda:0'
+    LLM_device = 'cuda:0'
 else:
     SUPIR_device = 'cpu'
-    LLaVA_device = 'cpu'
+    LLM_device = 'cpu'
 
 face_helper = None
 model: SUPIRModel = None
@@ -199,8 +199,8 @@ prompt_styles = ui_helpers.list_styles()
 # Make a list of prompt_styles keys
 prompt_styles_keys = list(prompt_styles.keys())
 
-selected_pos, selected_neg, llava_style_prompt = select_style(
-    prompt_styles_keys[0] if len(prompt_styles_keys) > 0 else "", default_llava_prompt, True)
+selected_pos, selected_neg, llm_style_prompt = select_style(
+    prompt_styles_keys[0] if len(prompt_styles_keys) > 0 else "", default_llm_prompt, True)
 
 
 # has global
@@ -309,24 +309,24 @@ def load_model(selected_model, selected_checkpoint, weight_dtype, sampler='DPMPP
 
 
 # has global
-def load_llava():
+def load_llm():
     global llm_agent
     if llm_agent is None:
-        llm_agent = MoondreamCaption(device=LLaVA_device, load_8bit=args.load_8bit_llava,
-                                     load_4bit=args.load_4bit_llava)
+        llm_agent = MoondreamCaption(device=LLM_device, load_8bit=args.load_8bit_llm,
+                                     load_4bit=args.load_4bit_llm)
         print("Loading Moondream.")
         llm_agent.load()
         print("Moondream loaded.")
 
 
 # has global
-def unload_llava():
+def unload_llm():
     global llm_agent
     if llm_agent:
         llm_agent = llm_agent.to('cpu')
         gc.collect()
         torch.cuda.empty_cache()
-        printt("Unloaded llava")
+        printt("Unloaded llm")
     return
 
 
@@ -344,7 +344,7 @@ def all_to_cpu_background():
         model.move_to('cpu')
         printt("Model moved to CPU")
     if llm_agent is not None:
-        unload_llava()
+        unload_llm()
     gc.collect()
     torch.cuda.empty_cache()
     printt("All moved to CPU")
@@ -385,7 +385,7 @@ def update_inputs(input_file, upscale_amount):
         video_start = 0
         end_time = video_attributes['frames']
         video_end = end_time
-        mid_time = int(end_time / 2)
+        mid_time = int(int(end_time) / 2)
         current_video_fps = video_attributes['framerate']
         total_video_frames = end_time
         video_end_time = gr.update(value=end_time)
@@ -562,7 +562,7 @@ def start_single_process(*element_values):
             except:
                 pass
     result = "An exception occurred. Please try again."
-    # auto_unload_llava, batch_process_folder, main_prompt, output_video_format, output_video_quality, outputs_folder,video_duration, video_fps, video_height, video_width
+    # auto_unload_llm, batch_process_folder, main_prompt, output_video_format, output_video_quality, outputs_folder,video_duration, video_fps, video_height, video_width
     keys_to_pop = ['batch_process_folder', 'main_prompt', 'output_video_format',
                    'output_video_quality', 'outputs_folder', 'video_duration', 'video_end', 'video_fps',
                    'video_height', 'video_start', 'video_width', 'src_file']
@@ -707,20 +707,20 @@ def llm_process(inputs: List[MediaData], temp, p, question=None, save_captions=F
     outputs = []
     total_steps = len(inputs) + 1
     step = 0
-    progress(step / total_steps, desc="Loading LLaVA...")
-    load_llava()
+    progress(step / total_steps, desc="Loading LLM...")
+    load_llm()
     if not isinstance(llm_agent, MoondreamCaption):
-        return "LLaVA failed to load."
+        return "LLM failed to load."
     step += 1
-    printt("Moving LLaVA to GPU.")
-    llm_agent = llm_agent.to(LLaVA_device)
-    printt("LLaVA moved to GPU.")
-    progress(step / total_steps, desc="LLaVA loaded, captioning images...")
+    printt("Moving LLM to GPU.")
+    llm_agent = llm_agent.to(LLM_device)
+    printt("LLM moved to GPU.")
+    progress(step / total_steps, desc="LLM loaded, captioning images...")
     for md in inputs:
         img = md.media_data
         img_path = md.media_path
-        progress(step / total_steps, desc=f"Processing image {step}/{len(inputs)} with LLaVA...")
-        if img is None:  ## this is for llava and video
+        progress(step / total_steps, desc=f"Processing image {step}/{len(inputs)} with LLM...")
+        if img is None:  ## this is for llm and video
             img = Image.open(img_path)
             img = np.array(img)
         lq = HWC3(img)
@@ -737,9 +737,9 @@ def llm_process(inputs: List[MediaData], temp, p, question=None, save_captions=F
             break
         step += 1
 
-    progress(step / total_steps, desc="LLaVA processing completed.")
+    progress(step / total_steps, desc="LLM processing completed.")
     status_container.image_data = outputs
-    return f"LLaVA Processing Completed: {len(inputs)} images processed at {time.ctime()}."
+    return f"LLM Processing Completed: {len(inputs)} images processed at {time.ctime()}."
 
 
 def update_video_slider(start_time, current_time, end_time, fps, total_frames, src_file, upscale_size):
@@ -756,7 +756,7 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                   upscale, edm_steps,
                   s_stage1, s_stage2, s_cfg, seed, sampler, s_churn, s_noise, color_fix_type, diff_dtype, ae_dtype,
                   linear_cfg, linear_s_stage2, spt_linear_cfg, spt_linear_s_stage2, model_select,
-                  ckpt_select, num_images, random_seed, apply_llava, face_resolution, apply_bg, apply_face,
+                  ckpt_select, num_images, random_seed, apply_llm, face_resolution, apply_bg, apply_face,
                   face_prompt, dont_update_progress=False, unload=True,
                   progress=gr.Progress()):
     global model, status_container, event_id
@@ -766,7 +766,7 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
     if unload:
         total_progress += 1
     counter = 0
-    unload_llava()
+    unload_llm()
     progress(counter / total_progress, desc="Loading SUPIR Model...")
     load_model(model_select, ckpt_select, diff_dtype, sampler, progress=progress)
     to_gpu(model, SUPIR_device)
@@ -798,7 +798,7 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
         idx = idx + 1
 
         # See if there is a caption file
-        if not apply_llava:
+        if not apply_llm:
             cap_path = os.path.join(os.path.splitext(image_path)[0] + ".txt")
             if os.path.exists(cap_path):
                 printt(f"Loading caption from {cap_path}...")
@@ -953,12 +953,12 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
 
 
 def batch_process(img_data,
-                  a_prompt, ae_dtype, apply_bg, apply_face, caption_chatgpt, apply_llava, apply_supir, ckpt_select,
+                  a_prompt, ae_dtype, apply_bg, apply_face, caption_select, apply_supir, ckpt_select,
                   color_fix_type,
                   diff_dtype, edm_steps, face_prompt, face_resolution, linear_CFG, linear_s_stage2,
                   make_comparison_video, model_select, n_prompt, num_images, num_samples, qs, random_seed,
                   s_cfg, s_churn, s_noise, s_stage1, s_stage2, sampler, save_captions, seed, spt_linear_CFG,
-                  spt_linear_s_stage2, temperature, top_p, upscale, auto_unload_llava, progress=gr.Progress()
+                  spt_linear_s_stage2, temperature, top_p, upscale, auto_unload_llm, progress=gr.Progress()
                   ):
     global is_processing, llm_agent, model, status_container
     ckpt_select = get_ckpt_path(ckpt_select, args.ckpt_dir)
@@ -970,8 +970,8 @@ def batch_process(img_data,
         return msg
     start_time = time.time()
     last_result = "Select something to do."
-    if not caption_chatgpt and not apply_llava and not apply_supir:
-        msg = "No processing selected. Please select LLaVA, SUPIR, or both to continue."
+    if caption_select is "None" and not apply_supir:
+        msg = "No processing selected. Please select LLM, SUPIR, or both to continue."
         printt(msg)
         return msg, msg
     if is_processing:
@@ -992,31 +992,31 @@ def batch_process(img_data,
     total_supir_steps = total_images * num_images + 2 if apply_supir else 0
 
     # Total images, plus 2 for load/unload
-    total_llava_steps = total_images + 2 if apply_llava else 0
+    total_llm_steps = total_images + 2 if caption_select != "None" else 0
 
     # Total steps, plus 1 for saving outputs
-    total_steps = total_supir_steps + total_llava_steps + 1
+    total_steps = total_supir_steps + total_llm_steps + 1
     counter = 0
-    # Disable llava for video...because...uh...yeah, video.
+    # Disable llm for video...because...uh...yeah, video.
     # if status_container.is_video:
-    #   apply_llava = False
+    #   apply_llm = False
     progress(0, desc=f"Processing {total_images} images...")
     printt(f"Processing {total_images} images...", reset=True)
-    if caption_chatgpt:
+    if caption_select == "ChatGPT":
         printt('Processing ChatGPT')
         last_result = chatgpt_process(img_data, temperature, top_p, qs, save_captions, progress=progress)
         printt('ChatGPT processing completed')
         # Update the img_data from the captioner
         img_data = status_container.image_data
 
-    if apply_llava:
-        printt('Processing LLaVA')
+    if caption_select == "LLM":
+        printt('Processing LLM')
         last_result = llm_process(img_data, temperature, top_p, qs, save_captions, progress=progress)
-        printt('LLaVA processing completed')
+        printt('LLM processing completed')
 
-        if auto_unload_llava:
-            unload_llava()
-            printt('LLaVA unloaded')
+        if auto_unload_llm:
+            unload_llm()
+            printt('LLM unloaded')
 
         # Update the img_data from the captioner
         img_data = status_container.image_data
@@ -1025,7 +1025,7 @@ def batch_process(img_data,
         progress(total_steps / total_steps, desc="Cancelling SUPIR...")
         all_to_cpu()
         return f"Batch Processing Completed: Cancelled at {time.ctime()}.", last_result
-    counter += total_llava_steps
+    counter += total_llm_steps
     if apply_supir:
         progress(counter / total_steps, desc="Processing images...")
         printt("Processing images (Stage 2)")
@@ -1033,7 +1033,7 @@ def batch_process(img_data,
                                     s_cfg, seed, sampler_cls, s_churn, s_noise, color_fix_type, diff_dtype, ae_dtype,
                                     linear_CFG, linear_s_stage2, spt_linear_CFG, spt_linear_s_stage2, model_select,
                                     ckpt_select,
-                                    num_images, random_seed, apply_llava, face_resolution, apply_bg, apply_face,
+                                    num_images, random_seed, caption_select != "None", face_resolution, apply_bg, apply_face,
                                     face_prompt, unload=True, progress=progress)
         printt("Processing images (Stage 2) Completed")
     counter += total_supir_steps
@@ -1320,9 +1320,11 @@ with (block):
                     with gr.Row():
                         upscale_slider = gr.Slider(label="Upscale Size", minimum=1, maximum=20, value=1, step=0.1)
                     with gr.Row():
+                        caption_select_radio = gr.Radio(label="Caption", choices=["None", "ChatGPT", "LLM"],
+                                                        value = "LLM" if openai_key is None else "ChatGPT")
                         caption_chatgpt_checkbox = gr.Checkbox(label="Caption ChatGPT", value=openai_key is not None,
                                                                interactive=openai_key is not None)
-                        apply_llava_checkbox = gr.Checkbox(label="Apply LLaVa", value=False)
+                        apply_llm_checkbox = gr.Checkbox(label="Apply LLaVa", value=False)
                         apply_supir_checkbox = gr.Checkbox(label="Apply SUPIR", value=True)
                     with gr.Row():
                         with gr.Column():
@@ -1351,10 +1353,10 @@ with (block):
                                                      value="")
                 with gr.Accordion("Caption options", open=False):
                     with gr.Column():
-                        auto_unload_llava_checkbox = gr.Checkbox(label="Auto Unload LLaVA (Low VRAM)",
+                        auto_unload_llm_checkbox = gr.Checkbox(label="Auto Unload LLM (Low VRAM)",
                                                                  value=auto_unload)
-                        setattr(auto_unload_llava_checkbox, "do_not_save_to_config", True)
-                    qs_textbox = gr.Textbox(label="LLaVA prompt", value=llava_style_prompt)
+                        setattr(auto_unload_llm_checkbox, "do_not_save_to_config", True)
+                    qs_textbox = gr.Textbox(label="LLM prompt", value=llm_style_prompt)
                     temperature_slider = gr.Slider(label="Temperature", minimum=0.0, maximum=1.0, value=0.7, step=0.1)
                     top_p_slider = gr.Slider(label="Top P", minimum=0., maximum=1.0, value=0.7, step=0.1)
 
@@ -1641,10 +1643,9 @@ with (block):
         "ae_dtype": ae_dtype_radio,
         "apply_bg": apply_bg_checkbox,
         "apply_face": apply_face_checkbox,
-        "caption_chatgpt": caption_chatgpt_checkbox,
-        "apply_llava": apply_llava_checkbox,
+        "caption_select": caption_select_radio,
         "apply_supir": apply_supir_checkbox,
-        "auto_unload_llava": auto_unload_llava_checkbox,
+        "auto_unload_llm": auto_unload_llm_checkbox,
         "batch_process_folder": batch_process_folder_textbox,
         "ckpt_select": ckpt_select_dropdown,
         "color_fix_type": color_fix_type_radio,
@@ -1784,8 +1785,7 @@ class BatchProcessInputs(BaseModel):
     ae_dtype: str = "bf16"
     apply_bg: bool = False
     apply_face: bool = False
-    caption_chatgpt: bool = False
-    apply_llava: bool = False
+    caption_select: str = "LLM"
     apply_supir: bool = True
     ckpt_select: str = "SDXL Lightning"
     color_fix_type: str = "Wavelet"
@@ -1815,7 +1815,7 @@ class BatchProcessInputs(BaseModel):
     temperature: float = 0.0
     top_p: float = 0.7
     upscale: int = 1
-    auto_unload_llava: bool = False
+    auto_unload_llm: bool = False
 
 
 def decode_base64_to_image(base64_str):
@@ -1835,7 +1835,7 @@ async def batch_process_endpoint(inputs: BatchProcessInputs, background_tasks: B
         result_msg, last_result = batch_process(
             processed_img_data,
             inputs.a_prompt, inputs.ae_dtype, inputs.apply_bg, inputs.apply_face, inputs.caption_chatgpt,
-            inputs.apply_llava, inputs.apply_supir, inputs.ckpt_select,
+            inputs.apply_llm, inputs.apply_supir, inputs.ckpt_select,
             inputs.color_fix_type,
             inputs.diff_dtype, inputs.edm_steps, inputs.face_prompt, inputs.face_resolution, inputs.linear_CFG,
             inputs.linear_s_stage2,
@@ -1843,7 +1843,7 @@ async def batch_process_endpoint(inputs: BatchProcessInputs, background_tasks: B
             inputs.qs, inputs.random_seed,
             inputs.s_cfg, inputs.s_churn, inputs.s_noise, inputs.s_stage1, inputs.s_stage2, inputs.sampler,
             inputs.save_captions, inputs.seed, inputs.spt_linear_CFG,
-            inputs.spt_linear_s_stage2, inputs.temperature, inputs.top_p, inputs.upscale, inputs.auto_unload_llava
+            inputs.spt_linear_s_stage2, inputs.temperature, inputs.top_p, inputs.upscale, inputs.auto_unload_llm
         )
 
         # Base64 encode the results
