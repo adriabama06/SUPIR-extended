@@ -1,88 +1,54 @@
 import os
-import requests
-from tqdm import tqdm
+
 from huggingface_hub import snapshot_download
 
-
-def create_directory(path):
-    """Create directory if it does not exist."""
-    if not os.path.exists(path):
-        os.makedirs(path)
-        print(f'Directory created: {path}')
-    else:
-        print(f'Directory already exists: {path}')
+# Set the environment variable HF_HUB_ENABLE_HF_TRANSFER=1
+os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1'
 
 
-def download_file(url, folder_path, file_name=None):
-    """Download a file from a given URL to a specified folder with an optional file name."""
-    local_filename = file_name if file_name else url.split('/')[-1]
-    local_filepath = os.path.join(folder_path, local_filename)
-
-    # Check if file exists and verify its size
-    if os.path.exists(local_filepath):
-        print(f'File already exists: {local_filepath}')
-        expected_size = get_remote_file_size(url)
-        actual_size = os.path.getsize(local_filepath)
-        if expected_size == actual_size:
-            print(f'File is already downloaded and verified: {local_filepath}')
-            return
-        else:
-            print(f'File size mismatch, redownloading: {local_filepath}')
-
-    print(f'Downloading {url} to: {local_filepath}')
-    # Stream download to handle large files
-    with requests.get(url, stream=True) as r:
-        r.raise_for_status()
-        total_size_in_bytes = int(r.headers.get('content-length', 0))
-        block_size = 1024  # 1 Kibibyte
-        progress_bar = tqdm(total=total_size_in_bytes, unit='iB', unit_scale=True)
-        with open(local_filepath, 'wb') as f:
-            for data in r.iter_content(block_size):
-                progress_bar.update(len(data))
-                f.write(data)
-        progress_bar.close()
-
-    if total_size_in_bytes != 0 and progress_bar.n != total_size_in_bytes:
-        print('ERROR, something went wrong')
-    else:
-        print(f'Downloaded {local_filename} to {folder_path}')
-
-
-def get_remote_file_size(url):
-    """Get the size of a file at a remote URL."""
-    with requests.head(url) as r:
-        size = int(r.headers.get('content-length', 0))
-    return size
-
-
-# Define the folders and their corresponding file URLs with optional file names
-folders_and_files = {
-    os.path.join('models'): [
-        ('https://huggingface.co/laion/CLIP-ViT-bigG-14-laion2B-39B-b160k/resolve/main/open_clip_pytorch_model.bin', None),
-        ('https://huggingface.co/ashleykleynhans/SUPIR/resolve/main/SUPIR-v0F.ckpt', 'v0F.ckpt'),
-        ('https://huggingface.co/ashleykleynhans/SUPIR/resolve/main/SUPIR-v0Q.ckpt', 'v0Q.ckpt')
+def download_models(download_lightning: bool = True):
+    # Repo, files, folder
+    repos = [
+        ('laion/CLIP-ViT-bigG-14-laion2B-39B-b160k', 'open_clip_pytorch_model.bin', None),
+        ('ashleykleynhans/SUPIR', ['SUPIR-v0F.ckpt', 'SUPIR-v0Q.ckpt'], None),
+        ('Kijai/SUPIR_pruned', ['SUPIR-v0Q_fp16.safetensors', 'SUPIR-v0F_fp16.safetensors'], None),
+        ('vikhyatk/moondream2', None, 'moondream2'),
+        ('openai/clip-vit-large-patch14-336', None, None),
+        ('openai/clip-vit-large-patch14', None, None)
     ]
-}
+    if download_lightning:
+        repos.append(
+            ('RunDiffusion/Juggernaut-XL-Lightning', 'Juggernaut_RunDiffusionPhoto2_Lightning_4Steps.safetensors',
+             'checkpoints'))
+    else:
+        repos.append(('RunDiffusion/Juggernaut-X-v10', 'Juggernaut-X-RunDiffusion-NSFW.safetensors', 'checkpoints'))
+
+    model_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'))
+
+    # If models/V0F.ckpt or models/V0Q.ckpt exist, rename them to 'SUPIR-v0F.ckpt' and 'SUPIR-v0Q.ckpt'
+    if os.path.exists(os.path.join(model_dir, 'V0F.ckpt')):
+        os.rename(os.path.join(model_dir, 'V0F.ckpt'), os.path.join(model_dir, 'SUPIR-v0F.ckpt'))
+
+    if os.path.exists(os.path.join(model_dir, 'V0Q.ckpt')):
+        os.rename(os.path.join(model_dir, 'V0Q.ckpt'), os.path.join(model_dir, 'SUPIR-v0Q.ckpt'))
+
+    for repo, model_file, model_folder in repos:
+        print(f"Checking for {repo} model...")
+        if model_file is None:
+            model_folder = repo.split('/')[1]
+            model_path = os.path.join(model_dir, model_folder)
+            allow_patterns = None
+        else:
+            if model_folder is None:
+                model_path = model_dir
+            else:
+                model_path = os.path.join(model_dir, model_folder)
+            if isinstance(model_file, list):
+                allow_patterns = model_file
+            else:
+                allow_patterns = [model_file]
+        snapshot_download(repo, local_dir=model_path, allow_patterns=allow_patterns)
 
 
 if __name__ == '__main__':
-    for folder, files in folders_and_files.items():
-        create_directory(folder)
-        for file_url, file_name in files:
-            download_file(file_url, folder, file_name)
-
-    llava_model = os.getenv('LLAVA_MODEL', 'liuhaotian/llava-v1.5-7b')
-    llava_clip_model = 'openai/clip-vit-large-patch14-336'
-    sdxl_clip_model = 'openai/clip-vit-large-patch14'
-
-    print(f'Downloading LLaVA model: {llava_model}')
-    model_folder = llava_model.split('/')[1]
-    snapshot_download(llava_model, local_dir=os.path.join("models", model_folder), local_dir_use_symlinks=False)
-
-    print(f'Downloading LLaVA CLIP model: {llava_clip_model}')
-    model_folder = llava_clip_model.split('/')[1]
-    snapshot_download(llava_clip_model, local_dir=os.path.join("models", model_folder), local_dir_use_symlinks=False)
-
-    print(f'Downloading SDXL CLIP model: {sdxl_clip_model}')
-    model_folder = sdxl_clip_model.split('/')[1]
-    snapshot_download(sdxl_clip_model, local_dir=os.path.join("models", model_folder), local_dir_use_symlinks=False)
+    download_models()
