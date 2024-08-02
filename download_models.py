@@ -10,7 +10,7 @@ def download_models(download_lightning: bool = True):
     # Repo, files, folder
     repos = [
         ('laion/CLIP-ViT-bigG-14-laion2B-39B-b160k', 'open_clip_pytorch_model.bin', None),
-        ('ashleykleynhans/SUPIR', ['SUPIR-v0F.ckpt', 'SUPIR-v0Q.ckpt'], None),
+        #('ashleykleynhans/SUPIR', ['SUPIR-v0F.ckpt', 'SUPIR-v0Q.ckpt'], None),
         ('Kijai/SUPIR_pruned', ['SUPIR-v0Q_fp16.safetensors', 'SUPIR-v0F_fp16.safetensors'], None),
         ('vikhyatk/moondream2', None, 'moondream2'),
         ('openai/clip-vit-large-patch14-336', None, None),
