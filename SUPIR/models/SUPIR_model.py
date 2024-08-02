@@ -141,36 +141,36 @@ class SUPIRModel(DiffusionEngine):
         seed_everything(seed)
         
         
-        printt("Encoding first stage with denoise...")
+        printt("Encoding first stage with denoise")
         _z = self.encode_first_stage_with_denoise(x, use_sample=False)
-        printt("Encoded first stage with denoise...")
+        printt("Encoded first stage with denoise")
         x_stage1 = self.decode_first_stage(_z)
-        printt("Decoded first stage...")
+        printt("Decoded first stage")
         z_stage1 = self.encode_first_stage(x_stage1)
-        printt("Encoded first stage...")
+        printt("Encoded first stage")
 
         c, uc = self.prepare_condition(_z, p, p_p, n_p, n)
 
-        printt("Loading denoiser.")
+        printt("Loading denoiser")
         denoiser = lambda input, sigma, c, control_scale: self.denoiser(
             self.model, input, sigma, c, control_scale, **kwargs
         )
-        printt("Loaded denoiser.")
+        printt("Loaded denoiser")
 
         noised_z = torch.randn_like(_z).to(_z.device)
-        printt("Sampling...")
+        printt("Sampling")
         _samples = self.sampler(denoiser, noised_z, cond=c, uc=uc, x_center=z_stage1, control_scale=control_scale,
                                 use_linear_control_scale=use_linear_control_scale,
                                 control_scale_start=control_scale_start)
-        printt("Sampled.")
+        printt("Sampled")
         output = self.decode_first_stage(_samples)
-        printt("Decoded output.")
+        printt("Decoded output")
         if color_fix_type == 'Wavelet':
             output = wavelet_reconstruction(output, x_stage1)
-            printt("Wavelet reconstructed.")
+            printt("Wavelet reconstructed")
         elif color_fix_type == 'AdaIn':
             output = adaptive_instance_normalization(output, x_stage1)
-            printt("AdaIn reconstructed.")
+            printt("AdaIn reconstructed")
         return output
 
     def init_tile_vae(self, encoder_tile_size=512, decoder_tile_size=64, use_fast=False):

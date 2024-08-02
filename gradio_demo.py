@@ -39,6 +39,7 @@ from ui_helpers import is_video, extract_video, compile_video, is_image, get_vid
     select_style, open_folder, set_info_attributes, list_models, get_ckpt_path, selected_model, to_gpu, slider_html, \
     title_md, claim_md, refresh_symbol, dl_symbol, fullscreen_symbol, default_llm_prompt, update_model_settings, \
     read_image_metadata, submit_feedback, refresh_models_click
+from upscale.upscaler import upscale_models
 
 SUPIR_REVISION = "v49"
 
@@ -757,7 +758,7 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                   s_stage1, s_stage2, s_cfg, seed, sampler, s_churn, s_noise, color_fix_type, diff_dtype, ae_dtype,
                   linear_cfg, linear_s_stage2, spt_linear_cfg, spt_linear_s_stage2, model_select,
                   ckpt_select, num_images, random_seed, apply_llm, face_resolution, apply_bg, apply_face,
-                  face_prompt, dont_update_progress=False, unload=True,
+                  face_prompt, upscaler, dont_update_progress=False, unload=True,
                   progress=gr.Progress()):
     global model, status_container, event_id
     main_begin_time = time.time()
@@ -807,7 +808,7 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
 
         img = HWC3(img)
         printt("Upscaling image (pre)...")
-        img = upscale_image(img, upscale, unit_resolution=32, min_size=1024)
+        img = upscale_image(img, upscale, upscaler, unit_resolution=32, min_size=1024)
 
         lq = np.array(img)
         lq = lq / 255 * 2 - 1
@@ -958,7 +959,7 @@ def batch_process(img_data,
                   diff_dtype, edm_steps, face_prompt, face_resolution, linear_CFG, linear_s_stage2,
                   make_comparison_video, model_select, n_prompt, num_images, num_samples, qs, random_seed,
                   s_cfg, s_churn, s_noise, s_stage1, s_stage2, sampler, save_captions, seed, spt_linear_CFG,
-                  spt_linear_s_stage2, temperature, top_p, upscale, auto_unload_llm, progress=gr.Progress()
+                  spt_linear_s_stage2, temperature, top_p, upscale, auto_unload_llm, upscaler, progress=gr.Progress()
                   ):
     global is_processing, llm_agent, model, status_container
     ckpt_select = get_ckpt_path(ckpt_select, args.ckpt_dir)
@@ -970,7 +971,7 @@ def batch_process(img_data,
         return msg
     start_time = time.time()
     last_result = "Select something to do."
-    if caption_select is "None" and not apply_supir:
+    if caption_select == "None" and not apply_supir:
         msg = "No processing selected. Please select LLM, SUPIR, or both to continue."
         printt(msg)
         return msg, msg
@@ -1034,7 +1035,7 @@ def batch_process(img_data,
                                     linear_CFG, linear_s_stage2, spt_linear_CFG, spt_linear_s_stage2, model_select,
                                     ckpt_select,
                                     num_images, random_seed, caption_select != "None", face_resolution, apply_bg, apply_face,
-                                    face_prompt, unload=True, progress=progress)
+                                    face_prompt, upscaler, unload=True, progress=progress)
         printt("Processing images (Stage 2) Completed")
     counter += total_supir_steps
     progress(counter / total_steps, desc="Processing completed.")
@@ -1319,12 +1320,12 @@ with (block):
                 with gr.Accordion("General options", open=True):
                     with gr.Row():
                         upscale_slider = gr.Slider(label="Upscale Size", minimum=1, maximum=20, value=1, step=0.1)
+                        upscalers = [key for key in upscale_models.keys()]
+                        upscaler = gr.Dropdown(label="Upscaler", choices=upscalers,
+                                                value=upscalers[0], interactive=True)
                     with gr.Row():
                         caption_select_radio = gr.Radio(label="Caption", choices=["None", "ChatGPT", "LLM"],
                                                         value = "LLM" if openai_key is None else "ChatGPT")
-                        caption_chatgpt_checkbox = gr.Checkbox(label="Caption ChatGPT", value=openai_key is not None,
-                                                               interactive=openai_key is not None)
-                        apply_llm_checkbox = gr.Checkbox(label="Apply LLaVa", value=False)
                         apply_supir_checkbox = gr.Checkbox(label="Apply SUPIR", value=True)
                     with gr.Row():
                         with gr.Column():
@@ -1686,6 +1687,7 @@ with (block):
         "video_height": video_height_textbox,
         "video_start": video_start_time_number,
         "video_width": video_width_textbox,
+        "upscaler": upscaler,
     }
 
     extra_info_elements = {

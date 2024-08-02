@@ -384,8 +384,12 @@ const elementsConfig = {
         showInfoButton: true
     },
     "apply_face": {title: "This will apply face restoration during SUPIR upscaling.", showInfoButton: true},
-    "apply_llava": {
-        title: "This will apply LLaVa captioning to the input. NOT recommended for video.",
+    "caption_select": {
+        title: "Select what (if any) captioning to apply to the image before processing.",
+        showInfoButton: true
+    },
+    "upscaler": {
+        title: "Select the upscale model to use before processing. Different models might produce varied results.",
         showInfoButton: true
     },
     "apply_supir": {title: "Process the image using SUPIR with the selected settings.", showInfoButton: true},

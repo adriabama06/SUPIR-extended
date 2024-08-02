@@ -10,6 +10,7 @@ from torch.nn.functional import interpolate
 from SUPIR.utils import models_utils, sd_model_initialization, shared
 from SUPIR.utils.devices import torch_gc
 from sgm.util import instantiate_from_config
+from upscale.upscaler import SUPiRUpscaler
 
 try:
     from ui_helpers import printt
@@ -147,7 +148,7 @@ def HWC3(x):
         return y
 
 
-def upscale_image(input_image, upscale, min_size=None, unit_resolution=64):
+def upscale_image(input_image, upscale, upscaler, min_size=None, unit_resolution=64):
     h, w, c = input_image.shape
     h = float(h)
     w = float(w)
@@ -160,8 +161,10 @@ def upscale_image(input_image, upscale, min_size=None, unit_resolution=64):
             h *= _upscale
     h = int(np.round(h / unit_resolution)) * unit_resolution
     w = int(np.round(w / unit_resolution)) * unit_resolution
-    img = cv2.resize(input_image, (w, h), interpolation=cv2.INTER_LANCZOS4 if upscale > 1 else cv2.INTER_AREA)
-    img = img.round().clip(0, 255).astype(np.uint8)
+    upscale_model = SUPiRUpscaler(upscaler)
+    img = upscale_model.process(input_image)
+    # img = cv2.resize(input_image, (w, h), interpolation=cv2.INTER_LANCZOS4 if upscale > 1 else cv2.INTER_AREA)
+    # img = img.round().clip(0, 255).astype(np.uint8)
     return img
 
 
