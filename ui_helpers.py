@@ -256,7 +256,7 @@ def list_styles():
     styles_path = os.path.join(os.path.dirname(__file__), 'styles')
     output = {}
     style_files = []
-    llava_prompt = default_llava_prompt
+    llava_prompt = default_llm_prompt
     for root, dirs, files in os.walk(styles_path):
         for file in files:
             if file.endswith('.csv'):
@@ -415,7 +415,7 @@ The service is a research preview ~~intended for non-commercial use only~~, subj
 refresh_symbol = "\U000027F3"  # ⟳
 dl_symbol = "\U00002B73"  # ⭳
 fullscreen_symbol = "\U000026F6"  # ⛶
-default_llava_prompt = "Describe this image and its style in a very detailed manner. The image is a realistic photography, not an art painting."
+default_llm_prompt = "Describe this image and its style in a very detailed manner. The image is a realistic photography, not an art painting."
 
 
 def update_model_settings(model_type, param_setting):
