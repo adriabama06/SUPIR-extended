@@ -1,39 +1,45 @@
 import argparse
-import datetime
+import base64
 import gc
+import io
+import json
 import os
 import shutil
-import tempfile
 import threading
 import time
 import traceback
-import json
-from datetime import datetime
-from typing import Tuple, List, Any, Dict
+from typing import Tuple, List
 
 import einops
 import gradio as gr
 import numpy as np
 import requests
 import torch
+import uvicorn
 from PIL import Image
 from PIL import PngImagePlugin
+from fastapi import FastAPI, BackgroundTasks
 from gradio_imageslider import ImageSlider
+from pydantic import BaseModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import ui_helpers
 from SUPIR.models.SUPIR_model import SUPIRModel
 from SUPIR.util import HWC3, upscale_image, convert_dtype
 from SUPIR.util import create_SUPIR_model
 from SUPIR.utils import shared
+from SUPIR.utils.ckpt_downloader import download_checkpoint_handler
 from SUPIR.utils.compare import create_comparison_video
 from SUPIR.utils.face_restoration_helper import FaceRestoreHelper
-from SUPIR.utils.model_fetch import get_model
-from SUPIR.utils.rename_meta import rename_meta_key, rename_meta_key_reverse
-from SUPIR.utils.ckpt_downloader import download_checkpoint_handler, download_checkpoint
-
+from SUPIR.utils.rename_meta import rename_meta_key
 from SUPIR.utils.status_container import StatusContainer, MediaData
-from llava.llava_agent import LLavaAgent
-from ui_helpers import is_video, extract_video, compile_video, is_image, get_video_params, printt
+from caption.caption_llm import LLMCaption, MoondreamCaption
+from download_models import download_models
+from openai_prompt import prompt_prompt
+from ui_helpers import is_video, extract_video, compile_video, is_image, get_video_params, printt, refresh_styles_click, \
+    select_style, open_folder, set_info_attributes, list_models, get_ckpt_path, selected_model, to_gpu, slider_html, \
+    title_md, claim_md, refresh_symbol, dl_symbol, fullscreen_symbol, default_llava_prompt, update_model_settings, \
+    read_image_metadata, submit_feedback, refresh_models_click
 
 SUPIR_REVISION = "v49"
 
@@ -44,14 +50,16 @@ parser.add_argument("--port", type=int, help="Port number for the server to list
 parser.add_argument("--log_history", action='store_true', default=False, help="Enable logging of request history.")
 parser.add_argument("--loading_half_params", action='store_true', default=False,
                     help="Enable loading model parameters in half precision to reduce memory usage.")
-parser.add_argument("--fp8", action='store_true', default=False, 
+parser.add_argument("--fp8", action='store_true', default=False,
                     help="Enable loading model parameters in FP8 precision to reduce memory usage.")
-parser.add_argument("--autotune", action='store_true', default=False, help="Automatically set precision parameters based on the amount of VRAM available.")
-parser.add_argument("--fast_load_sd", action='store_true', default=False, 
+parser.add_argument("--autotune", action='store_true', default=False,
+                    help="Automatically set precision parameters based on the amount of VRAM available.")
+parser.add_argument("--fast_load_sd", action='store_true', default=False,
                     help="Enable fast loading of model state dict and to prevents unnecessary memory allocation.")
 parser.add_argument("--use_tile_vae", action='store_true', default=False,
                     help="Enable tiling for the VAE to handle larger images with limited memory.")
-parser.add_argument("--outputs_folder_button",action='store_true', default=False, help="Outputs Folder Button Will Be Enabled")
+parser.add_argument("--outputs_folder_button", action='store_true', default=False,
+                    help="Outputs Folder Button Will Be Enabled")
 parser.add_argument("--use_fast_tile", action='store_true', default=False,
                     help="Use a faster tile encoding/decoding, may impact quality.")
 parser.add_argument("--encoder_tile_size", type=int, default=512,
@@ -62,7 +70,7 @@ parser.add_argument("--load_8bit_llava", action='store_true', default=False,
                     help="Load the LLAMA model in 8-bit precision to save memory.")
 parser.add_argument("--load_4bit_llava", action='store_true', default=True,
                     help="Load the LLAMA model in 4-bit precision to significantly reduce memory usage.")
-parser.add_argument("--ckpt", type=str, default='Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors',
+parser.add_argument("--ckpt", type=str, default='Juggernaut_RunDiffusionPhoto2_Lightning_4Steps.safetensors',
                     help="Path to the checkpoint file for the model.")
 parser.add_argument("--ckpt_browser", action='store_true', default=True, help="Enable a checkpoint selection dropdown.")
 parser.add_argument("--ckpt_dir", type=str, default='models/checkpoints',
@@ -76,6 +84,10 @@ parser.add_argument("--debug", action='store_true', default=False,
                     help="Enable debug mode, disables open_browser, and adds ui buttons for testing elements.")
 parser.add_argument("--dont_move_cpu", action='store_true', default=False,
                     help="Disables moving models to the CPU after completed. If you have sufficient VRAM enable this.")
+parser.add_argument("--openai_api_key", type=str, default='',
+                    help="Enter your OpenAI API Key to support captioning with ChatGPT.")
+parser.add_argument("--no_download_models", action='store_true', default=False,
+                    help="Disable downloading models on startup.")
 
 args = parser.parse_args()
 ui_helpers.ui_args = args
@@ -89,6 +101,14 @@ meta_upload = False
 bf16_supported = torch.cuda.is_bf16_supported()
 total_vram = 100000
 auto_unload = False
+openai_key = args.openai_api_key
+if openai_key == '':
+    openai_key = None
+
+if not args.no_download_models:
+    download_lightning = "lightning" in args.ckpt.lower()
+    download_models(download_lightning)
+
 if torch.cuda.is_available() and args.autotune:
     # Get total GPU memory
     total_vram = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
@@ -100,17 +120,90 @@ if torch.cuda.is_available() and args.autotune:
     if total_vram <= 24:
         if not args.loading_half_params:
             args.loading_half_params = True
-        if not args.use_tile_vae:
-            args.use_tile_vae = True
+        # if not args.use_tile_vae:
+        #     args.use_tile_vae = True
     print("Auto Unload: ", auto_unload)
     print("Half Params: ", args.loading_half_params)
     print("FP8: ", args.fp8)
     print("Tile VAE: ", args.use_tile_vae)
 
-shared.opts.half_mode = args.loading_half_params  
+shared.opts.half_mode = args.loading_half_params
 shared.opts.fast_load_sd = args.fast_load_sd
 
+models_dir = os.path.join(os.path.dirname(__file__), 'models')
 
+if args.fp8:
+    shared.opts.half_mode = args.fp8
+    shared.opts.fp8_storage = args.fp8
+
+server_ip = args.ip
+if args.debug:
+    args.open_browser = False
+
+if args.ckpt_dir == "models/checkpoints":
+    args.ckpt_dir = os.path.join(os.path.dirname(__file__), "models", "checkpoints")
+    if not os.path.exists(args.ckpt_dir):
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+
+if torch.cuda.device_count() >= 2:
+    SUPIR_device = 'cuda:0'
+    LLaVA_device = 'cuda:1'
+elif torch.cuda.device_count() == 1:
+    SUPIR_device = 'cuda:0'
+    LLaVA_device = 'cuda:0'
+else:
+    SUPIR_device = 'cpu'
+    LLaVA_device = 'cpu'
+
+face_helper = None
+model: SUPIRModel = None
+llm_agent = None
+models_loaded = False
+unique_counter = 0
+status_container = StatusContainer()
+
+# Store this globally so we can update variables more easily
+elements_dict = {}
+extra_info_elements = {}
+
+single_process = False
+is_processing = False
+last_used_checkpoint = None
+
+css_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'css', 'style.css'))
+slider_css_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'css', 'nouislider.min.css'))
+
+with open(css_file) as f:
+    css = f.read()
+
+with open(slider_css_file) as f:
+    slider_css = f.read()
+
+js_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'javascript', 'demo.js'))
+no_slider_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'javascript', 'nouislider.min.js'))
+
+with open(js_file) as f:
+    js = f.read()
+
+with open(no_slider_file) as f:
+    no_slider = f.read()
+
+head = f"""
+<style media="screen">{css}</style>
+<style media="screen">{slider_css}</style>
+<script type="text/javascript">{js}</script>
+<script type="text/javascript">{no_slider}</script>
+"""
+
+prompt_styles = ui_helpers.list_styles()
+# Make a list of prompt_styles keys
+prompt_styles_keys = list(prompt_styles.keys())
+
+selected_pos, selected_neg, llava_style_prompt = select_style(
+    prompt_styles_keys[0] if len(prompt_styles_keys) > 0 else "", default_llava_prompt, True)
+
+
+# has global
 def apply_metadata(image_path):
     if image_path is None:
         return
@@ -146,68 +239,8 @@ def apply_metadata(image_path):
 
     return updates
 
-if args.fp8:
-    shared.opts.half_mode = args.fp8
-    shared.opts.fp8_storage = args.fp8
 
-server_ip = args.ip
-if args.debug:
-    args.open_browser = False
-
-if args.ckpt_dir == "models/checkpoints":
-    args.ckpt_dir = os.path.join(os.path.dirname(__file__), args.ckpt_dir)
-    if not os.path.exists(args.ckpt_dir):
-        os.makedirs(args.ckpt_dir, exist_ok=True)
-
-if torch.cuda.device_count() >= 2:
-    SUPIR_device = 'cuda:0'
-    LLaVA_device = 'cuda:1'
-elif torch.cuda.device_count() == 1:
-    SUPIR_device = 'cuda:0'
-    LLaVA_device = 'cuda:0'
-else:
-    SUPIR_device = 'cpu'
-    LLaVA_device = 'cpu'
-
-face_helper = None
-model: SUPIRModel = None
-llava_agent = None
-models_loaded = False
-unique_counter = 0
-status_container = StatusContainer()
-
-# Store this globally so we can update variables more easily
-elements_dict = {}
-extra_info_elements = {}
-
-single_process = False
-is_processing = False
-last_used_checkpoint = None
-
-slider_html = """
-<div id="keyframeSlider" class="keyframe-slider">
-  <div id="frameSlider"></div>
-
-  <!-- Labels for start and end times -->
-  <div class="labels">
-    <span id="startTimeLabel">0:00:00</span>
-    <span id="nowTimeLabel">0:00:30</span>
-    <span id="endTimeLabel">0:01:00</span>
-  </div>
-</div>
-"""
-
-def refresh_models_click():
-    new_model_list = list_models()
-    return gr.update(choices=new_model_list)
-
-
-def refresh_styles_click():
-    new_style_list = list_styles()
-    style_list = list(new_style_list.keys())
-    return gr.update(choices=style_list)
-
-
+# has global
 def update_start_time(src_file, upscale_size, start_time):
     global video_start
     video_start = start_time
@@ -215,6 +248,7 @@ def update_start_time(src_file, upscale_size, start_time):
     return gr.update(value=target_res_text, visible=target_res_text != "")
 
 
+# has global
 def update_end_time(src_file, upscale_size, end_time):
     global video_end
     video_end = end_time
@@ -222,127 +256,7 @@ def update_end_time(src_file, upscale_size, end_time):
     return gr.update(value=target_res_text, visible=target_res_text != "")
 
 
-def select_style(style_name, current_prompt=None, values=False):
-    style_list = list_styles()
-
-    if style_name in style_list.keys():
-        style_pos, style_neg, style_llava = style_list[style_name]
-        if values:
-            return style_pos, style_neg, style_llava
-        return gr.update(value=style_pos), gr.update(value=style_neg), gr.update(value=style_llava)
-    if values:
-        return "", "", ""
-    return gr.update(value=""), gr.update(value=""), gr.update(value="")
-
-
-import platform
-
-
-def open_folder():
-    open_folder_path = os.path.abspath(args.outputs_folder)
-    if platform.system() == "Windows":
-        os.startfile(open_folder_path)
-    elif platform.system() == "Linux":
-        os.system(f'xdg-open "{open_folder_path}"')
-
-
-def set_info_attributes(elements_to_set: Dict[str, Any]):
-    output = {}
-    for key, value in elements_to_set.items():
-        if not getattr(value, 'elem_id', None):
-            setattr(value, 'elem_id', key)
-        classes = getattr(value, 'elem_classes', None)
-        if isinstance(classes, list):
-            if "info-btn" not in classes:
-                classes.append("info-button")
-                setattr(value, 'elem_classes', classes)
-        output[key] = value
-    return output
-
-
-def list_models():
-    model_dir = args.ckpt_dir
-    output = []
-    if os.path.exists(model_dir):
-        output = [os.path.join(model_dir, f) for f in os.listdir(model_dir) if
-                  f.endswith('.safetensors') or f.endswith('.ckpt')]
-    else:
-        local_model_dir = os.path.join(os.path.dirname(__file__), args.ckpt_dir)
-        if os.path.exists(local_model_dir):
-            output = [os.path.join(local_model_dir, f) for f in os.listdir(local_model_dir) if
-                      f.endswith('.safetensors') or f.endswith('.ckpt')]
-    if os.path.exists(args.ckpt) and args.ckpt not in output:
-        output.append(args.ckpt)
-    else:
-        if os.path.exists(os.path.join(os.path.dirname(__file__), args.ckpt)):
-            output.append(os.path.join(os.path.dirname(__file__), args.ckpt))
-    # Sort the models
-    output = [os.path.basename(f) for f in output]
-    # Ensure the values are unique
-    output = list(set(output))
-    output.sort()
-    return output
-
-
-def get_ckpt_path(ckpt_path):
-    if os.path.exists(ckpt_path):
-        return ckpt_path
-    else:
-        if os.path.exists(args.ckpt_dir):
-            return os.path.join(args.ckpt_dir, ckpt_path)
-        local_model_dir = os.path.join(os.path.dirname(__file__), args.ckpt_dir)
-        if os.path.exists(local_model_dir):
-            return os.path.join(local_model_dir, ckpt_path)
-    return None
-
-
-def list_styles():
-    styles_path = os.path.join(os.path.dirname(__file__), 'styles')
-    output = {}
-    style_files = []
-    llava_prompt = default_llava_prompt
-    for root, dirs, files in os.walk(styles_path):
-        for file in files:
-            if file.endswith('.csv'):
-                style_files.append(os.path.join(root, file))
-    for style_file in style_files:
-        with open(style_file, 'r') as f:
-            lines = f.readlines()
-            # Parse lines, skipping the first line
-            for line in lines[1:]:
-                line = line.strip()
-                if len(line) > 0:
-                    name = line.split(',')[0]
-                    cap_line = line.replace(name + ',', '')
-                    captions = cap_line.split('","')
-                    if len(captions) >= 2:
-                        positive_prompt = captions[0].replace('"', '')
-                        negative_prompt = captions[1].replace('"', '')
-                        if "{prompt}" in positive_prompt:
-                            positive_prompt = positive_prompt.replace("{prompt}", "")
-
-                        if "{prompt}" in negative_prompt:
-                            negative_prompt = negative_prompt.replace("{prompt}", "")
-
-                        if len(captions) == 3:
-                            llava_prompt = captions[2].replace('"', "")
-
-                        output[name] = (positive_prompt, negative_prompt, llava_prompt)
-
-    return output
-
-
-def selected_model():
-    models = list_models()
-    target_model = args.ckpt
-    if os.path.basename(target_model) in models:
-        return target_model
-    else:
-        if len(models) > 0:
-            return models[0]
-    return None
-
-
+# has global
 def load_face_helper():
     global face_helper
     if face_helper is None:
@@ -355,7 +269,9 @@ def load_face_helper():
         )
 
 
-def load_model(selected_model, selected_checkpoint, weight_dtype, sampler='DPMPP2M', device='cpu', progress=gr.Progress()):
+# has global
+def load_model(selected_model, selected_checkpoint, weight_dtype, sampler='DPMPP2M', device='cpu',
+               progress=gr.Progress()):
     global model, last_used_checkpoint
 
     # Determine the need for model loading or updating
@@ -381,50 +297,44 @@ def load_model(selected_model, selected_checkpoint, weight_dtype, sampler='DPMPP
         last_used_checkpoint = checkpoint_use
         model_cfg = "options/SUPIR_v0_tiled.yaml" if args.use_tile_vae else "options/SUPIR_v0.yaml"
         weight_dtype = 'fp16' if not bf16_supported else weight_dtype
-        model = create_SUPIR_model(model_cfg, weight_dtype, supir_sign=selected_model[-1], device=device, ckpt=checkpoint_use,
+        model = create_SUPIR_model(model_cfg, weight_dtype, supir_sign=selected_model[-1], device=device,
+                                   ckpt=checkpoint_use,
                                    sampler=sampler)
         model.current_model = selected_model
-     
+
         if args.use_tile_vae:
             model.init_tile_vae(encoder_tile_size=512, decoder_tile_size=64, use_fast=args.use_fast_tile)
         if progress is not None:
             progress(1, desc="SUPIR loaded.")
 
 
+# has global
 def load_llava():
-    global llava_agent
-    if llava_agent is None:
-        llava_path = get_model('liuhaotian/llava-v1.5-7b')
-        llava_agent = LLavaAgent(llava_path, device=LLaVA_device, load_8bit=args.load_8bit_llava,
-                                 load_4bit=args.load_4bit_llava)
+    global llm_agent
+    if llm_agent is None:
+        llm_agent = MoondreamCaption(device=LLaVA_device, load_8bit=args.load_8bit_llava,
+                                     load_4bit=args.load_4bit_llava)
+        print("Loading Moondream.")
+        llm_agent.load()
+        print("Moondream loaded.")
 
 
+# has global
 def unload_llava():
-    global llava_agent
-    if args.load_4bit_llava or args.load_8bit_llava:
-        printt("Clearing LLaVA.")
-        clear_llava()
-        printt("LLaVA cleared.")
-    else:
-        printt("Unloading LLaVA.")
-        llava_agent = llava_agent.to('cpu')
+    global llm_agent
+    if llm_agent:
+        llm_agent = llm_agent.to('cpu')
         gc.collect()
         torch.cuda.empty_cache()
-        printt("LLaVA unloaded.")
+        printt("Unloaded llava")
+    return
 
 
-def clear_llava():
-    global llava_agent
-    del llava_agent
-    llava_agent = None
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
+# has global
 def all_to_cpu_background():
     if args.dont_move_cpu:
         return
-    global face_helper, model, llava_agent, auto_unload
+    global face_helper, model, llm_agent, auto_unload
     printt("Moving all to CPU")
     if face_helper is not None:
         face_helper = face_helper.to('cpu')
@@ -433,13 +343,14 @@ def all_to_cpu_background():
         model = model.to('cpu')
         model.move_to('cpu')
         printt("Model moved to CPU")
-    if llava_agent is not None:
-        if auto_unload:
-            unload_llava()
+    if llm_agent is not None:
+        unload_llava()
     gc.collect()
     torch.cuda.empty_cache()
     printt("All moved to CPU")
 
+
+# has global
 
 def all_to_cpu():
     if args.dont_move_cpu:
@@ -448,53 +359,7 @@ def all_to_cpu():
     cpu_thread.start()
 
 
-def to_gpu(elem_to_load, device):
-    if elem_to_load is not None:
-        elem_to_load = elem_to_load.to(device)
-        if getattr(elem_to_load, 'move_to', None):
-            elem_to_load.move_to(device)
-        torch.cuda.set_device(device)
-    return elem_to_load
-
-
-def update_model_settings(model_type, param_setting):
-    """
-    Returns a series of gr.updates with settings based on the model type.
-    If 'model_type' contains 'lightning', it uses the settings for a 'lightning' SDXL model.
-    Otherwise, it uses the settings for a normal SDXL model.
-    s_cfg_Quality, spt_linear_CFG_Quality, s_cfg_Fidelity, spt_linear_CFG_Fidelity, edm_steps
-    """
-    # Default settings for a "lightning" SDXL model
-    lightning_settings = {
-        's_cfg_Quality': 2.0,
-        'spt_linear_CFG_Quality': 2.0,
-        's_cfg_Fidelity': 1.5,
-        'spt_linear_CFG_Fidelity': 1.5,
-        'edm_steps': 10
-    }
-
-    # Default settings for a normal SDXL model
-    normal_settings = {
-        's_cfg_Quality': 7.5,
-        'spt_linear_CFG_Quality': 4.0,
-        's_cfg_Fidelity': 4.0,
-        'spt_linear_CFG_Fidelity': 1.0,
-        'edm_steps': 50
-    }
-
-    # Choose the settings based on the model type
-    settings = lightning_settings if 'Lightning' in model_type else normal_settings
-
-    if param_setting == "Quality":
-        s_cfg = settings['s_cfg_Quality']
-        spt_linear_CFG = settings['spt_linear_CFG_Quality']
-    else:
-        s_cfg = settings['s_cfg_Fidelity']
-        spt_linear_CFG = settings['spt_linear_CFG_Fidelity']
-
-    return gr.update(value=s_cfg), gr.update(value=spt_linear_CFG), gr.update(value=settings['edm_steps'])
-
-
+# has global
 def update_inputs(input_file, upscale_amount):
     global current_video_fps, total_video_frames, video_start, video_end
     file_input = gr.update(visible=True)
@@ -538,6 +403,7 @@ def update_inputs(input_file, upscale_amount):
     return file_input, image_input, video_slider, res_output, video_start_time, video_end_time, video_current_time, video_fps, video_total_frames
 
 
+# has global
 def update_target_resolution(img, do_upscale):
     global last_input_path, last_video_params
     if img is None:
@@ -590,42 +456,6 @@ def update_target_resolution(img, do_upscale):
     output += ''.join(''.join(output_lines[i:i + 2]) for i in range(0, len(output_lines), 2))
     output += '</tr></table>'
     return output
-
-
-def read_image_metadata(image_path):
-    if image_path is None:
-        return
-    # Check if the file exists
-    if not os.path.exists(image_path):
-        return "File does not exist."
-
-    # Get the last modified date and format it
-    last_modified_timestamp = os.path.getmtime(image_path)
-    last_modified_date = datetime.fromtimestamp(last_modified_timestamp).strftime('%d %B %Y, %H:%M %p - UTC')
-
-    # Open the image and extract metadata
-    with Image.open(image_path) as img:
-        width, height = img.size
-        megapixels = (width * height) / 1e6
-
-        metadata_str = f"Last Modified Date: {last_modified_date}\nMegapixels: {megapixels:.2f}\n"
-
-        # Extract metadata based on image format
-        if img.format == 'JPEG':
-            exif_data = img._getexif()
-            if exif_data:
-                for tag, value in exif_data.items():
-                    tag_name = Image.ExifTags.TAGS.get(tag, tag)
-                    metadata_str += f"{tag_name}: {value}\n"
-        else:
-            metadata = img.info
-            if metadata:
-                for key, value in metadata.items():
-                    metadata_str += f"{key}: {value}\n"
-            else:
-                metadata_str += "No additional metadata found."
-
-    return metadata_str
 
 
 def update_elements(status_label):
@@ -685,44 +515,6 @@ def update_elements(status_label):
     return prompt_el, result_gallery_el, result_slider_el, result_video_el, comparison_video_el, event_id_el, seed_el, face_gallery_el
 
 
-def populate_slider_single():
-    # Fetch the image at http://www.marketingtool.online/en/face-generator/img/faces/avatar-1151ce9f4b2043de0d2e3b7826127998.jpg
-    # and use it as the input image
-    temp_path = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-    temp_path.write(requests.get(
-        "http://www.marketingtool.online/en/face-generator/img/faces/avatar-1151ce9f4b2043de0d2e3b7826127998.jpg").content)
-    temp_path.close()
-    lowres_path = temp_path.name.replace('.jpg', '_lowres.jpg')
-    with Image.open(temp_path.name) as img:
-        current_dims = (img.size[0] // 2, img.size[1] // 2)
-        resized_dims = (img.size[0] // 4, img.size[1] // 4)
-        img = img.resize(current_dims)
-        img.save(temp_path.name)
-        img = img.resize(resized_dims)
-        img.save(lowres_path)
-    return (gr.update(value=[lowres_path, temp_path.name], visible=True,
-                      elem_classes=["active", "preview_slider", "preview_box"]),
-            gr.update(visible=False, value=None, elem_classes=["preview_box"]))
-
-
-def populate_gallery():
-    temp_path = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-    temp_path.write(requests.get(
-        "http://www.marketingtool.online/en/face-generator/img/faces/avatar-1151ce9f4b2043de0d2e3b7826127998.jpg").content)
-    temp_path.close()
-    lowres_path = temp_path.name.replace('.jpg', '_lowres.jpg')
-    with Image.open(temp_path.name) as img:
-        current_dims = (img.size[0] // 2, img.size[1] // 2)
-        resized_dims = (img.size[0] // 4, img.size[1] // 4)
-        img = img.resize(current_dims)
-        img.save(temp_path.name)
-        img = img.resize(resized_dims)
-        img.save(lowres_path)
-    return gr.update(value=[lowres_path, temp_path.name], visible=True,
-                     elem_classes=["preview_box", "active"]), gr.update(visible=False, value=None,
-                                                                        elem_classes=["preview_slider", "preview_box"])
-
-
 def start_single_process(*element_values):
     global status_container, is_processing
     status_container = StatusContainer()
@@ -780,6 +572,7 @@ def start_single_process(*element_values):
     values_dict = {k: v for k, v in values_dict.items() if k not in keys_to_pop}
 
     try:
+        print(f"Batch processing: {values_dict}")
         _, result = batch_process(img_data, **values_dict)
     except Exception as e:
         print(f"An exception occurred: {e} at {traceback.format_exc()}")
@@ -836,16 +629,91 @@ def start_batch_process(*element_values):
     return result
 
 
-def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions=False, progress=gr.Progress()):
-    global llava_agent, status_container
+def chatgpt_process(inputs: List[MediaData], temp, p, question=None, save_captions=False, progress=gr.Progress()):
+    global openai_key
+    outputs = []
+    total_steps = len(inputs) + 1
+    step = 0
+    progress(step / total_steps, desc="Loading ChatGPT...")
+    if openai_key is None:
+        openai_key = os.getenv('OPENAI_API_KEY')
+
+    if openai_key is None:
+        return "OpenAI API key is not set."
+
+    # client = OpenAI()
+    for md in inputs:
+        img_path = md.media_path
+        progress(step / total_steps, desc=f"Processing image {step}/{len(inputs)} with ChatGPT...")
+
+        with open(img_path, "rb") as image_file:
+            img_data = base64.b64encode(image_file.read()).decode('utf-8')
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {openai_key}"
+        }
+
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt_prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_data}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 300
+        }
+
+        response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+        json_response = response.json()
+        # Caption will be under the "positive" key from the response
+        caption = json_response
+
+        try:
+            caption = json_response['choices'][0]['message']['content']
+            caption_dict = json.loads(caption)
+            caption = caption_dict['positive']
+            md.caption = caption
+            outputs.append(md)
+            if save_captions:
+                cap_path = os.path.splitext(img_path)[0] + ".txt"
+                with open(cap_path, 'w') as cf:
+                    cf.write(caption)
+        except Exception as e:
+            print(f"Error processing caption: {caption} ({e})")
+        if not is_processing:  # Check if batch processing has been stopped
+            break
+        step += 1
+    progress(step / total_steps, desc="ChatGPT processing completed.")
+    status_container.image_data = outputs
+    return f"ChatGPT Processing Completed: {len(inputs)} images processed at {time.ctime()}."
+
+
+def llm_process(inputs: List[MediaData], temp, p, question=None, save_captions=False, progress=gr.Progress()):
+    global llm_agent, status_container
     outputs = []
     total_steps = len(inputs) + 1
     step = 0
     progress(step / total_steps, desc="Loading LLaVA...")
     load_llava()
+    if not isinstance(llm_agent, MoondreamCaption):
+        return "LLaVA failed to load."
     step += 1
     printt("Moving LLaVA to GPU.")
-    llava_agent = to_gpu(llava_agent, LLaVA_device)
+    llm_agent = llm_agent.to(LLaVA_device)
     printt("LLaVA moved to GPU.")
     progress(step / total_steps, desc="LLaVA loaded, captioning images...")
     for md in inputs:
@@ -857,8 +725,8 @@ def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions
             img = np.array(img)
         lq = HWC3(img)
         lq = Image.fromarray(lq.astype('uint8'))
-        caption = llava_agent.gen_image_caption([lq], temperature=temp, top_p=p, qs=question)
-        caption = caption[0]
+        caption = llm_agent.caption(lq, question, temp, p)
+        print(f"Caption: {caption}")
         md.caption = caption
         outputs.append(md)
         if save_captions:
@@ -874,8 +742,6 @@ def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions
     return f"LLaVA Processing Completed: {len(inputs)} images processed at {time.ctime()}."
 
 
-# video_start_time_number, video_current_time_number, video_end_time_number,
-#                      video_fps_number, video_total_frames_number, src_input_file, upscale_slider
 def update_video_slider(start_time, current_time, end_time, fps, total_frames, src_file, upscale_size):
     print(f"Updating video slider: {start_time}, {current_time}, {end_time}, {fps}, {src_file}")
     global video_start, video_end
@@ -900,18 +766,18 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
     if unload:
         total_progress += 1
     counter = 0
+    unload_llava()
     progress(counter / total_progress, desc="Loading SUPIR Model...")
     load_model(model_select, ckpt_select, diff_dtype, sampler, progress=progress)
     to_gpu(model, SUPIR_device)
 
     counter += 1
     progress(counter / total_progress, desc="Model Loaded, Processing Images...")
-    model.ae_dtype = convert_dtype('fp32' if bf16_supported == False else ae_dtype)
-    model.model.dtype = convert_dtype('fp16' if bf16_supported == False else diff_dtype)
+    model.ae_dtype = convert_dtype('fp32' if bf16_supported is False else ae_dtype)
+    model.model.dtype = convert_dtype('fp16' if bf16_supported is False else diff_dtype)
 
     idx = 0
     output_data = []
-    processed_images = 0
     params = status_container.process_params
 
     for image_data in inputs:
@@ -988,7 +854,8 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                                                 num_samples=num_samples, p_p=a_prompt, n_p=n_prompt,
                                                 color_fix_type=color_fix_type,
                                                 use_linear_cfg=linear_cfg, use_linear_control_scale=linear_s_stage2,
-                                                cfg_scale_start=spt_linear_cfg, control_scale_start=spt_linear_s_stage2, sampler_cls=sampler)
+                                                cfg_scale_start=spt_linear_cfg, control_scale_start=spt_linear_s_stage2,
+                                                sampler_cls=sampler)
 
                 if is_face and face_resolution < 1024:
                     samples = samples[:, :, 512 - face_resolution // 2:512 + face_resolution // 2,
@@ -1033,7 +900,7 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                 else:
                     result = _bg[0]
 
-            if not apply_bg and apply_face:                
+            if not apply_bg and apply_face:
                 face_helper.get_inverse_affine(None)
 
                 # the image the face helper is using is already scaled to the desired resolution using lanzcos
@@ -1086,22 +953,24 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
 
 
 def batch_process(img_data,
-                  a_prompt, ae_dtype, apply_bg, apply_face, apply_llava, apply_supir, ckpt_select, color_fix_type,
+                  a_prompt, ae_dtype, apply_bg, apply_face, caption_chatgpt, apply_llava, apply_supir, ckpt_select,
+                  color_fix_type,
                   diff_dtype, edm_steps, face_prompt, face_resolution, linear_CFG, linear_s_stage2,
                   make_comparison_video, model_select, n_prompt, num_images, num_samples, qs, random_seed,
                   s_cfg, s_churn, s_noise, s_stage1, s_stage2, sampler, save_captions, seed, spt_linear_CFG,
                   spt_linear_s_stage2, temperature, top_p, upscale, auto_unload_llava, progress=gr.Progress()
                   ):
-    global is_processing, llava_agent, model, status_container
-    ckpt_select = get_ckpt_path(ckpt_select)
+    global is_processing, llm_agent, model, status_container
+    ckpt_select = get_ckpt_path(ckpt_select, args.ckpt_dir)
     tiled = "TiledRestore" if args.use_tile_vae else "Restore"
     sampler_cls = f"sgm.modules.diffusionmodules.sampling.{tiled}{sampler}Sampler"
     if not ckpt_select:
         msg = "No checkpoint selected. Please select a checkpoint to continue."
+        printt(msg)
         return msg
     start_time = time.time()
     last_result = "Select something to do."
-    if not apply_llava and not apply_supir:
+    if not caption_chatgpt and not apply_llava and not apply_supir:
         msg = "No processing selected. Please select LLaVA, SUPIR, or both to continue."
         printt(msg)
         return msg, msg
@@ -1133,9 +1002,16 @@ def batch_process(img_data,
     #   apply_llava = False
     progress(0, desc=f"Processing {total_images} images...")
     printt(f"Processing {total_images} images...", reset=True)
+    if caption_chatgpt:
+        printt('Processing ChatGPT')
+        last_result = chatgpt_process(img_data, temperature, top_p, qs, save_captions, progress=progress)
+        printt('ChatGPT processing completed')
+        # Update the img_data from the captioner
+        img_data = status_container.image_data
+
     if apply_llava:
         printt('Processing LLaVA')
-        last_result = llava_process(img_data, temperature, top_p, qs, save_captions, progress=progress)
+        last_result = llm_process(img_data, temperature, top_p, qs, save_captions, progress=progress)
         printt('LLaVA processing completed')
 
         if auto_unload_llava:
@@ -1198,6 +1074,7 @@ def batch_process(img_data,
     return f"Batch Processing Completed: processed {total_images * num_images} images at in {end_time - start_time:.2f} seconds #{unique_counter}", last_result
 
 
+# has global
 def save_image(image_data: MediaData, is_video_frame: bool):
     global status_container
     if len(image_data.metadata_list) >= 1:
@@ -1300,6 +1177,7 @@ def save_compare_video(image_data: MediaData, params):
     return image_data
 
 
+# has global
 def stop_batch_upscale(progress=gr.Progress()):
     global is_processing
     progress(1, f"Stop command giving please wait to stop")
@@ -1335,23 +1213,10 @@ def load_and_reset(param_setting):
     return e_steps, s_cfg, sstage2, sstage1, schurn, snoise, ap, np, cfix_type, l_cfg, l_s_stage2, spt_linear_CFG, l_s_s_stage2
 
 
-def submit_feedback(evt_id, f_score, f_text):
-    if args.log_history:
-        with open(f'./history/{evt_id[:5]}/{evt_id[5:]}/logs.txt', 'r') as f:
-            event_dict = eval(f.read())
-        f.close()
-        event_dict['feedback'] = {'score': f_score, 'text': f_text}
-        with open(f'./history/{evt_id[:5]}/{evt_id[5:]}/logs.txt', 'w') as f:
-            f.write(str(event_dict))
-        f.close()
-        return 'Submit successfully, thank you for your comments!'
-    else:
-        return 'Submit failed, the server is not set to log history.'
-
-
 preview_full = False
 
 
+# ui func
 def toggle_full_preview():
     global preview_full
     gal_classes = ["preview_col"]
@@ -1366,64 +1231,17 @@ def toggle_full_preview():
     return gr.update(elem_classes=gal_classes), gr.update(elem_classes=btn_classes), gr.update(elem_classes=btn_classes)
 
 
-def toggle_compare_elements(enable: bool) -> Tuple[gr.update, gr.update]:
+# ui func
+def toggle_compare_elements(enable: bool) -> Tuple[gr.update, gr.update, gr.update]:
     return gr.update(visible=enable), gr.update(visible=enable), gr.update(visible=enable)
 
 
-title_md = """
-# **SUPIR: Practicing Model Scaling for Photo-Realistic Image Restoration**
-
-1 Click Installer (auto download models as well) : https://www.patreon.com/posts/99176057
-
-FFmpeg Install Tutorial : https://youtu.be/-NjNy7afOQ0 &emsp; [[Paper](https://arxiv.org/abs/2401.13627)] &emsp; [[Project Page](http://supir.xpixel.group/)] &emsp; [[How to play](https://github.com/Fanghua-Yu/SUPIR/blob/master/assets/DemoGuide.png)]
-"""
-
-claim_md = """
-## **Terms of use**
-
-By using this service, users are required to agree to the following terms: The service is a research preview intended for non-commercial use only. It only provides limited safety measures and may generate offensive content. It must not be used for any illegal, harmful, violent, racist, or sexual purposes. The service may collect user dialogue data for future research. Please submit a feedback to us if you get any inappropriate answer! We will collect those to keep improving our models. For an optimal experience, please use desktop computers for this demo, as mobile devices may compromise its quality.
-
-## **License**
-While the original readme for the project *says* it's non-commercial, it was *actually* released under the MIT license. That means that the project can be used for whatever you want.
-
-And yes, it would certainly be nice if anything anybody stuck in a random readme were the ultimate gospel when it comes to licensing, unfortunately, that's just
-not how the world works. MIT license means FREE FOR ANY PURPOSE, PERIOD.
-The service is a research preview ~~intended for non-commercial use only~~, subject to the model [License](https://github.com/Fanghua-Yu/SUPIR#MIT-1-ov-file) of SUPIR.
-"""
-
-css_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'css', 'style.css'))
-slider_css_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'css', 'nouislider.min.css'))
-
-with open(css_file) as f:
-    css = f.read()
-
-with open(slider_css_file) as f:
-    slider_css = f.read()
-
-js_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'javascript', 'demo.js'))
-no_slider_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'javascript', 'nouislider.min.js'))
-
-with open(js_file) as f:
-    js = f.read()
-
-with open(no_slider_file) as f:
-    no_slider = f.read()
-
-head = f"""
-<style media="screen">{css}</style>
-<style media="screen">{slider_css}</style>
-<script type="text/javascript">{js}</script>
-<script type="text/javascript">{no_slider}</script>
-"""
-
-refresh_symbol = "\U000027F3"  # ⟳
-dl_symbol = "\U00002B73"  # ⭳
-fullscreen_symbol = "\U000026F6"  # ⛶
-
-
-def update_meta(selected_file):
+# has global
+def update_meta(selected_file: str):
     # Returns [meta_image, meta_video]
     global meta_upload
+    if selected_file is None:
+        return gr.update(visible=False), gr.update(visible=False)
     if meta_upload is not None and selected_file == "" and selected_file is not None:
         # Don't change if cleared from upload
         return gr.update(visible=True, value=None), gr.update()
@@ -1435,20 +1253,14 @@ def update_meta(selected_file):
         return gr.update(visible=True, value=None), gr.update(visible=False)
 
 
+# has global
 def clear_meta():
     global meta_upload
     meta_upload = None
     # Returns [meta_image, meta_video, meta_file_browser, meta_file_upload, metadata_output]
-    return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True), gr.update(value=None), gr.update(value=None)
+    return gr.update(visible=False), gr.update(visible=False), gr.update(visible=True), gr.update(
+        value=None), gr.update(value=None)
 
-
-default_llava_prompt = "Describe this image and its style in a very detailed manner. The image is a realistic photography, not an art painting."
-prompt_styles = list_styles()
-# Make a list of prompt_styles keys
-prompt_styles_keys = list(prompt_styles.keys())
-
-selected_pos, selected_neg, llava_style_prompt = select_style(
-    prompt_styles_keys[0] if len(prompt_styles_keys) > 0 else "", default_llava_prompt, True)
 
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
 
@@ -1505,16 +1317,11 @@ with (block):
         with gr.Row():
             with gr.Column():
                 with gr.Accordion("General options", open=True):
-                    if args.debug:
-                        populate_slider_button = gr.Button(value="Populate Slider")
-                        populate_gallery_button = gr.Button(value="Populate Gallery")
-                        populate_slider_button.click(fn=populate_slider_single, outputs=[result_slider, result_gallery],
-                                                     show_progress=True, queue=True)
-                        populate_gallery_button.click(fn=populate_gallery, outputs=[result_gallery, result_slider],
-                                                      show_progress=True, queue=True)
                     with gr.Row():
                         upscale_slider = gr.Slider(label="Upscale Size", minimum=1, maximum=20, value=1, step=0.1)
                     with gr.Row():
+                        caption_chatgpt_checkbox = gr.Checkbox(label="Caption ChatGPT", value=openai_key is not None,
+                                                               interactive=openai_key is not None)
                         apply_llava_checkbox = gr.Checkbox(label="Apply LLaVa", value=False)
                         apply_supir_checkbox = gr.Checkbox(label="Apply SUPIR", value=True)
                     with gr.Row():
@@ -1528,26 +1335,27 @@ with (block):
                         show_select = args.ckpt_browser
                         with gr.Column():
                             with gr.Row(elem_id="model_select_row", visible=show_select):
-                                ckpt_select_dropdown = gr.Dropdown(label="Model", choices=list_models(),
-                                                                   value=selected_model(),
+                                ckpt_select_dropdown = gr.Dropdown(label="Model",
+                                                                   choices=list_models(args.ckpt_dir, args.ckpt),
+                                                                   value=selected_model(args.ckpt, args.ckpt_dir),
                                                                    interactive=True)
                                 refresh_models_button = gr.Button(value=refresh_symbol, elem_classes=["refresh_button"],
                                                                   size="sm")
                     with gr.Row(elem_id="model_select_row", visible=show_select):
                         ckpt_type = gr.Dropdown(label="Checkpoint Type", choices=["Standard SDXL", "SDXL Lightning"],
-                                                value="Standard SDXL")
+                                                value="SDXL Lightning")
 
                     prompt_textbox = gr.Textbox(label="Prompt", value="")
                     face_prompt_textbox = gr.Textbox(label="Face Prompt",
                                                      placeholder="Optional, uses main prompt if not provided",
                                                      value="")
-                with gr.Accordion("LLaVA options", open=False):
+                with gr.Accordion("Caption options", open=False):
                     with gr.Column():
                         auto_unload_llava_checkbox = gr.Checkbox(label="Auto Unload LLaVA (Low VRAM)",
                                                                  value=auto_unload)
                         setattr(auto_unload_llava_checkbox, "do_not_save_to_config", True)
-                    qs_textbox = gr.Textbox(label="LLaVA prompt",value=llava_style_prompt)
-                    temperature_slider = gr.Slider(label="Temperature", minimum=0., maximum=1.0, value=0.2, step=0.1)
+                    qs_textbox = gr.Textbox(label="LLaVA prompt", value=llava_style_prompt)
+                    temperature_slider = gr.Slider(label="Temperature", minimum=0.0, maximum=1.0, value=0.7, step=0.1)
                     top_p_slider = gr.Slider(label="Top P", minimum=0., maximum=1.0, value=0.7, step=0.1)
 
                 with gr.Accordion("SUPIR options", open=False):
@@ -1560,8 +1368,11 @@ with (block):
                         with gr.Column():
                             random_seed_checkbox = gr.Checkbox(label="Randomize Seed", value=True)
                     with gr.Row():
-                        edm_steps_slider = gr.Slider(label="Steps", minimum=1, maximum=200, value=50, step=1)
-                        s_cfg_slider = gr.Slider(label="Text Guidance Scale", minimum=1.0, maximum=15.0, value=7.5,
+                        steps_default = 50 if "lightning" not in args.ckpt.lower() else 8
+                        edm_steps_slider = gr.Slider(label="Steps", minimum=1, maximum=200, value=steps_default, step=1)
+                        s_cfg_default = 7.5 if "lightning" not in args.ckpt.lower() else 2.0
+                        s_cfg_slider = gr.Slider(label="Text Guidance Scale", minimum=1.0, maximum=15.0,
+                                                 value=s_cfg_default,
                                                  step=0.1)
                         s_stage2_slider = gr.Slider(label="Stage2 Guidance Strength", minimum=0., maximum=1., value=1.,
                                                     step=0.05)
@@ -1608,8 +1419,9 @@ with (block):
                     with gr.Row():
                         with gr.Column():
                             linear_cfg_checkbox = gr.Checkbox(label="Linear CFG", value=True)
+                            lin_cfg_default = 4.0 if "lightning" in args.ckpt.lower() else 1.5
                             spt_linear_cfg_slider = gr.Slider(label="CFG Start", minimum=1.0,
-                                                              maximum=9.0, value=4.0, step=0.5)
+                                                              maximum=9.0, value=lin_cfg_default, step=0.5)
                         with gr.Column():
                             linear_s_stage2_checkbox = gr.Checkbox(label="Linear Stage2 Guidance", value=False)
                             spt_linear_s_stage2_slider = gr.Slider(label="Guidance Start", minimum=0,
@@ -1653,12 +1465,14 @@ with (block):
                     if not os.path.exists(presets_dir):
                         os.makedirs(presets_dir)
 
+
                     def save_preset(preset_name, config):
-                    #Save the current configuration to a file.
+                        # Save the current configuration to a file.
                         file_path = os.path.join(presets_dir, f"{preset_name}.json")
                         with open(file_path, 'w') as f:
                             json.dump(config, f)
                         return "Preset saved successfully!"
+
 
                     def load_preset(preset_name):
                         global elements_dict, extra_info_elements
@@ -1699,6 +1513,7 @@ with (block):
                         """List all saved presets."""
                         return [f.replace('.json', '') for f in os.listdir(presets_dir) if f.endswith('.json')]
 
+
                     def serialize_settings(ui_elements):
                         global elements_dict, extra_info_elements
                         serialized_dict = {}
@@ -1707,7 +1522,7 @@ with (block):
                         last_index = 0
                         for e_key, element_index in zip(elements_dict.keys(), range(len(ui_elements))):
                             element = ui_elements[element_index]
-                            last_index = element_index 
+                            last_index = element_index
                             # Check if the element has a 'value' attribute, otherwise use it directly
                             if hasattr(element, 'value'):
                                 serialized_dict[e_key] = element.value
@@ -1715,11 +1530,11 @@ with (block):
                                 serialized_dict[e_key] = element
 
                         # Process extra elements in extra_info_elements
-                        last_index=last_index+1
+                        last_index = last_index + 1
                         for extra_key, extra_element in extra_info_elements.items():
                             # Check if the extra element has a 'value' attribute, otherwise use directly
                             element = ui_elements[last_index]
-                            last_index=last_index+1
+                            last_index = last_index + 1
                             if hasattr(element, 'value'):
                                 serialized_dict[extra_key] = element.value
                             else:
@@ -1729,7 +1544,8 @@ with (block):
                         json_settings = json.dumps(serialized_dict)
                         return json_settings
 
-                    def save_current_preset(preset_name,*elements):
+
+                    def save_current_preset(preset_name, *elements):
                         if preset_name:
                             preset_path = os.path.join(presets_dir, f"{preset_name}.json")
                             settings = serialize_settings(elements)
@@ -1738,9 +1554,11 @@ with (block):
                             return "Preset saved successfully!"
                         return "Please provide a valid preset name."
 
+
                     def list_presets():
                         presets = [file.split('.')[0] for file in os.listdir(presets_dir) if file.endswith('.json')]
                         return presets
+
 
                     with gr.Row():
                         preset_name_textbox = gr.Textbox(label="Preset Name")
@@ -1763,14 +1581,17 @@ with (block):
                     output_files_refresh_btn = gr.Button(value=refresh_symbol, elem_classes=["refresh_button"],
                                                          size="sm")
 
+
                     def refresh_output_files():
                         return gr.update(value=args.outputs_folder)
 
+
                     output_files_refresh_btn.click(fn=refresh_output_files, outputs=[meta_file_browser],
-                                                   show_progress=True, queue=True)
+                                                   show_progress='full', queue=True)
             with gr.Column(elem_classes=["output_view_col"]):
                 apply_metadata_button = gr.Button("Apply Metadata")  # Add this line
-                meta_image = gr.Image(type="filepath", label="Output Image", elem_id="output_image", visible=True, height="42.5vh", sources=["upload"])
+                meta_image = gr.Image(type="filepath", label="Output Image", elem_id="output_image", visible=True,
+                                      height="42.5vh", sources=["upload"])
                 meta_video = gr.Video(label="Output Video", elem_id="output_video", visible=False, height="42.5vh")
                 metadata_output = gr.Textbox(label="Image Metadata", lines=25, max_lines=50, elem_id="output_metadata")
 
@@ -1782,7 +1603,7 @@ with (block):
                     choices=["SDXL 1.0 Base", "RealVisXL_V4", "Animagine XL V3.1", "Juggernaut XL V10"],
                     label="Select Model"
                 )
-            with gr.Column():      
+            with gr.Column():
                 download_button = gr.Button("Download")
                 download_output = gr.Textbox(label="Download Status")
 
@@ -1792,7 +1613,6 @@ with (block):
             inputs=[model_choice, model_download_dir],
             outputs=download_output
         )
-
 
     with gr.Tab("About"):
         gr.HTML(f"<H2>SUPIR Version {SUPIR_REVISION}</H2>")
@@ -1821,6 +1641,7 @@ with (block):
         "ae_dtype": ae_dtype_radio,
         "apply_bg": apply_bg_checkbox,
         "apply_face": apply_face_checkbox,
+        "caption_chatgpt": caption_chatgpt_checkbox,
         "apply_llava": apply_llava_checkbox,
         "apply_supir": apply_supir_checkbox,
         "auto_unload_llava": auto_unload_llava_checkbox,
@@ -1881,10 +1702,10 @@ with (block):
     elements_extra = list(extra_info_elements.values())
 
     start_single_button.click(fn=start_single_process, inputs=elements, outputs=output_label,
-                              show_progress=True, queue=True)
+                              show_progress='full', queue=True)
     start_batch_button.click(fn=start_batch_process, inputs=elements, outputs=output_label,
-                             show_progress=True, queue=True)
-    stop_batch_button.click(fn=stop_batch_upscale, show_progress=True, queue=True)
+                             show_progress='full', queue=True)
+    stop_batch_button.click(fn=stop_batch_upscale, show_progress='full', queue=True)
     reset_button.click(fn=load_and_reset, inputs=[param_setting_select],
                        outputs=[edm_steps_slider, s_cfg_slider, s_stage2_slider, s_stage1_slider, s_churn_slider,
                                 s_noise_slider, a_prompt_textbox, n_prompt_textbox,
@@ -1892,7 +1713,7 @@ with (block):
                                 spt_linear_cfg_slider, spt_linear_s_stage2_slider])
 
     # We just read the output_label and update all the elements when we find "Processing Complete"
-    output_label.change(fn=update_elements, show_progress=False, queue=True, inputs=[output_label],
+    output_label.change(fn=update_elements, show_progress='hidden', queue=True, inputs=[output_label],
                         outputs=output_elements)
 
     meta_file_browser.change(fn=update_meta, inputs=[meta_file_browser], outputs=[meta_image, meta_video])
@@ -1907,9 +1728,9 @@ with (block):
     upscale_slider.change(fn=update_target_resolution, inputs=[src_image_display, upscale_slider],
                           outputs=[target_res_textbox])
 
-    # slider_dl_button.click(fn=download_slider_image, inputs=[result_slider], show_progress=False, queue=True)
+    # slider_dl_button.click(fn=download_slider_image, inputs=[result_slider], show_progress='hidden', queue=True)
     slider_full_button.click(fn=toggle_full_preview, outputs=[result_col, slider_full_button, slider_dl_button],
-                             show_progress=False, queue=True, js="toggleFullscreen")
+                             show_progress='hidden', queue=True, js="toggleFullscreen")
 
     input_elements = [src_input_file, src_image_display, video_slider_display, target_res_textbox,
                       video_start_time_number, video_end_time_number, video_current_time_number, video_fps_number,
@@ -1934,21 +1755,107 @@ with (block):
     video_end_time_number.change(fn=update_end_time, inputs=[src_input_file, upscale_slider, video_end_time_number],
                                  outputs=target_res_textbox)
 
-    save_preset_button.click(fn=save_current_preset, inputs=[preset_name_textbox]+elements+elements_extra, outputs=[output_label])
-    refresh_presets_button.click(fn=lambda: gr.update(choices=list_presets()), inputs=[], outputs=[load_preset_dropdown])
-    load_preset_button.click(fn=load_preset, inputs=[load_preset_dropdown],outputs=[output_label] + elements+elements_extra,
-                show_progress=True, queue=True)
+    save_preset_button.click(fn=save_current_preset, inputs=[preset_name_textbox] + elements + elements_extra,
+                             outputs=[output_label])
+    refresh_presets_button.click(fn=lambda: gr.update(choices=list_presets()), inputs=[],
+                                 outputs=[load_preset_dropdown])
+    load_preset_button.click(fn=load_preset, inputs=[load_preset_dropdown],
+                             outputs=[output_label] + elements + elements_extra,
+                             show_progress='full', queue=True)
 
-    apply_metadata_button.click(fn=apply_metadata, inputs=[meta_image], outputs=[output_label] + elements+elements_extra,
-                show_progress=True, queue=True)
+    apply_metadata_button.click(fn=apply_metadata, inputs=[meta_image],
+                                outputs=[output_label] + elements + elements_extra,
+                                show_progress='full', queue=True)
+
 
     def do_nothing():
         pass
 
 
-    slider_dl_button.click(js="downloadImage", show_progress=False, queue=True, fn=do_nothing)
+    slider_dl_button.click(js="downloadImage", show_progress='hidden', queue=True, fn=do_nothing)
 
-if args.port is not None:  # Check if the --port argument is provided
-    block.launch(server_name=server_ip, server_port=args.port, share=args.share, inbrowser=args.open_browser)
-else:
-    block.launch(server_name=server_ip, share=args.share, inbrowser=args.open_browser)
+app = FastAPI()
+app = gr.mount_gradio_app(app, block, "/")
+
+
+class BatchProcessInputs(BaseModel):
+    img_data: List[str]  # List of base64-encoded image strings
+    a_prompt: str = "Cinematic, High Contrast, highly detailed..."
+    ae_dtype: str = "bf16"
+    apply_bg: bool = False
+    apply_face: bool = False
+    caption_chatgpt: bool = False
+    apply_llava: bool = False
+    apply_supir: bool = True
+    ckpt_select: str = "SDXL Lightning"
+    color_fix_type: str = "Wavelet"
+    diff_dtype: str = "bf16"
+    edm_steps: int = 50
+    face_prompt: str = ""
+    face_resolution: int = 1024
+    linear_CFG: bool = True
+    linear_s_stage2: bool = False
+    make_comparison_video: bool = False
+    model_select: str = "v0-Q"
+    n_prompt: str = "painting, oil painting, illustration..."
+    num_images: int = 1
+    num_samples: int = 1
+    qs: str = ""
+    random_seed: bool = True
+    s_cfg: float = 7.5
+    s_churn: int = 5
+    s_noise: float = 1.003
+    s_stage1: float = -1.0
+    s_stage2: float = 1.0
+    sampler: str = "DPMPP2M"
+    save_captions: bool = True
+    seed: int = -1
+    spt_linear_CFG: float = 4.0
+    spt_linear_s_stage2: float = 0.0
+    temperature: float = 0.0
+    top_p: float = 0.7
+    upscale: int = 1
+    auto_unload_llava: bool = False
+
+
+def decode_base64_to_image(base64_str):
+    image_data = base64.b64decode(base64_str)
+    return Image.open(io.BytesIO(image_data))
+
+
+@app.post("/batch_process")
+async def batch_process_endpoint(inputs: BatchProcessInputs, background_tasks: BackgroundTasks):
+    def process_and_encode():
+        # Decode base64 images to PIL images
+        decoded_images = [decode_base64_to_image(img) for img in inputs.img_data]
+
+        # Convert PIL images to a format suitable for batch_process
+        processed_img_data = [img.tobytes() for img in decoded_images]
+
+        result_msg, last_result = batch_process(
+            processed_img_data,
+            inputs.a_prompt, inputs.ae_dtype, inputs.apply_bg, inputs.apply_face, inputs.caption_chatgpt,
+            inputs.apply_llava, inputs.apply_supir, inputs.ckpt_select,
+            inputs.color_fix_type,
+            inputs.diff_dtype, inputs.edm_steps, inputs.face_prompt, inputs.face_resolution, inputs.linear_CFG,
+            inputs.linear_s_stage2,
+            inputs.make_comparison_video, inputs.model_select, inputs.n_prompt, inputs.num_images, inputs.num_samples,
+            inputs.qs, inputs.random_seed,
+            inputs.s_cfg, inputs.s_churn, inputs.s_noise, inputs.s_stage1, inputs.s_stage2, inputs.sampler,
+            inputs.save_captions, inputs.seed, inputs.spt_linear_CFG,
+            inputs.spt_linear_s_stage2, inputs.temperature, inputs.top_p, inputs.upscale, inputs.auto_unload_llava
+        )
+
+        # Base64 encode the results
+        if isinstance(last_result, list):
+            last_result = [base64.b64encode(res.encode()).decode() for res in last_result]
+        elif isinstance(last_result, str):
+            last_result = base64.b64encode(last_result.encode()).decode()
+        return result_msg, last_result
+
+    background_tasks.add_task(process_and_encode)
+    return {"message": "Batch processing started."}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=args.port if args.port else 7860)
