@@ -7,11 +7,15 @@ from PIL import Image
 from omegaconf import OmegaConf
 from torch.nn.functional import interpolate
 
-from SUPIR.utils import models_utils
+from SUPIR.utils import models_utils, sd_model_initialization, shared
 from SUPIR.utils.devices import torch_gc
 from sgm.util import instantiate_from_config
-from ui_helpers import printt
-from SUPIR.utils import models_utils, sd_model_initialization, shared
+
+try:
+    from ui_helpers import printt
+except:
+    printt = print
+
 
 def get_state_dict(d):
     return d.get('state_dict', d)
@@ -24,13 +28,19 @@ def load_state_dict(ckpt_path, location='cpu'):
         state_dict = safetensors.torch.load_file(ckpt_path, device=location)
     else:
         state_dict = get_state_dict(torch.load(ckpt_path, map_location=torch.device(location)))
-    state_dict = get_state_dict(state_dict)    
+    state_dict = get_state_dict(state_dict)
     return state_dict
 
 
 def create_SUPIR_model(config_path, weight_dtype='bf16', supir_sign=None, device='cpu', ckpt=None, sampler="DPMPP2M"):
-    # Load the model configuration
-    config = OmegaConf.load(config_path)
+    # See if config_path is a file or yaml string
+    if os.path.exists(config_path):
+        print(f"Loading model from config file: {config_path}")
+        config = OmegaConf.load(config_path)
+    else:
+        print(f"Loading model from config string")
+        config = OmegaConf.create(config_path)
+
     config.model.params.sampler_config.target = sampler
     if ckpt:
         config.SDXL_CKPT = ckpt
@@ -39,17 +49,14 @@ def create_SUPIR_model(config_path, weight_dtype='bf16', supir_sign=None, device
         'first_stage_model': None,
         'alphas_cumprod': None,
         '': convert_dtype(weight_dtype),
-    }   
+    }
     # Instantiate model from config
-    printt(f'Loading model from [{config_path}]')
     if shared.opts.fast_load_sd:
         with sd_model_initialization.DisableInitialization(disable_clip=False):
-            with sd_model_initialization.InitializeOnMeta():    
+            with sd_model_initialization.InitializeOnMeta():
                 model = instantiate_from_config(config.model)
     else:
         model = instantiate_from_config(config.model)
-
-    printt(f'Loaded model from [{config_path}]')
 
     # Function to load state dict to the chosen device
     def load_to_device(checkpoint_path):
@@ -60,9 +67,10 @@ def create_SUPIR_model(config_path, weight_dtype='bf16', supir_sign=None, device
             else:
                 tgt_device = 'cpu'
             state_dict = load_state_dict(checkpoint_path, tgt_device)
-            with sd_model_initialization.LoadStateDictOnMeta(state_dict, device=model.device, weight_dtype_conversion=weight_dtype_conversion):
-                models_utils.load_model_weights(model, state_dict)  
-            torch_gc()            
+            with sd_model_initialization.LoadStateDictOnMeta(state_dict, device=model.device,
+                                                             weight_dtype_conversion=weight_dtype_conversion):
+                models_utils.load_model_weights(model, state_dict)
+            torch_gc()
             printt(f'Loaded state_dict from [{checkpoint_path}]')
         else:
             printt(f'No checkpoint found at [{checkpoint_path}]')
@@ -73,7 +81,8 @@ def create_SUPIR_model(config_path, weight_dtype='bf16', supir_sign=None, device
     # Handling SUPIR checkpoints based on the sign
     if supir_sign:
         assert supir_sign in ['F', 'Q'], "supir_sign must be either 'F' or 'Q'"
-        ckpt_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", f"v0{supir_sign}.ckpt"))
+        ckpt_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "models", f"SUPIR-v0{supir_sign}_fp16.safetensors"))
         load_to_device(ckpt_path)
 
     model.sampler = sampler
