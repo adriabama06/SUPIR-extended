@@ -47,7 +47,7 @@ def download_models(download_lightning: bool = True):
                 allow_patterns = model_file
             else:
                 allow_patterns = [model_file]
-        snapshot_download(repo, local_dir=model_path, allow_patterns=allow_patterns)
+        snapshot_download(repo, local_dir=model_path, allow_patterns=allow_patterns, cache_dir="/tmp/SUPIR")
 
 
 if __name__ == '__main__':
