@@ -37,8 +37,7 @@ from download_models import download_models
 from openai_prompt import prompt_prompt
 from ui_helpers import is_video, extract_video, compile_video, is_image, get_video_params, printt, refresh_styles_click, \
     select_style, open_folder, set_info_attributes, list_models, get_ckpt_path, selected_model, to_gpu, slider_html, \
-    title_md, claim_md, refresh_symbol, dl_symbol, fullscreen_symbol, default_llm_prompt, update_model_settings, \
-    read_image_metadata, submit_feedback, refresh_models_click
+    title_md, claim_md, refresh_symbol, dl_symbol, fullscreen_symbol, default_llm_prompt, read_image_metadata, submit_feedback
 from upscale.upscaler import upscale_models
 
 SUPIR_REVISION = "v50"
@@ -1264,6 +1263,51 @@ def clear_meta():
 
 
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
+
+
+def refresh_models_click():
+    from gradio_demo import args
+    new_model_list = list_models(args.ckpt_dir, args.ckpt)
+    return gr.update(choices=new_model_list)
+
+
+def update_model_settings(model_type, param_setting):
+    """
+    Returns a series of gr.updates with settings based on the model type.
+    If 'model_type' contains 'lightning', it uses the settings for a 'lightning' SDXL model.
+    Otherwise, it uses the settings for a normal SDXL model.
+    s_cfg_Quality, spt_linear_CFG_Quality, s_cfg_Fidelity, spt_linear_CFG_Fidelity, edm_steps
+    """
+    # Default settings for a "lightning" SDXL model
+    lightning_settings = {
+        's_cfg_Quality': 2.0,
+        'spt_linear_CFG_Quality': 2.0,
+        's_cfg_Fidelity': 1.5,
+        'spt_linear_CFG_Fidelity': 1.5,
+        'edm_steps': 8
+    }
+
+    # Default settings for a normal SDXL model
+    normal_settings = {
+        's_cfg_Quality': 7.5,
+        'spt_linear_CFG_Quality': 4.0,
+        's_cfg_Fidelity': 4.0,
+        'spt_linear_CFG_Fidelity': 1.0,
+        'edm_steps': 50
+    }
+
+    # Choose the settings based on the model type
+    settings = lightning_settings if 'Lightning' in model_type else normal_settings
+
+    if param_setting == "Quality":
+        s_cfg = settings['s_cfg_Quality']
+        spt_linear_CFG = settings['spt_linear_CFG_Quality']
+    else:
+        s_cfg = settings['s_cfg_Fidelity']
+        spt_linear_CFG = settings['spt_linear_CFG_Fidelity']
+
+    return gr.update(value=s_cfg), gr.update(value=spt_linear_CFG), gr.update(value=settings['edm_steps'])
+
 
 with (block):
     with gr.Tab("Upscale"):

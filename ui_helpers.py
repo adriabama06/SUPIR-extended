@@ -418,44 +418,6 @@ fullscreen_symbol = "\U000026F6"  # ⛶
 default_llm_prompt = "Describe this image and its style in a very detailed manner. The image is a realistic photography, not an art painting."
 
 
-def update_model_settings(model_type, param_setting):
-    """
-    Returns a series of gr.updates with settings based on the model type.
-    If 'model_type' contains 'lightning', it uses the settings for a 'lightning' SDXL model.
-    Otherwise, it uses the settings for a normal SDXL model.
-    s_cfg_Quality, spt_linear_CFG_Quality, s_cfg_Fidelity, spt_linear_CFG_Fidelity, edm_steps
-    """
-    # Default settings for a "lightning" SDXL model
-    lightning_settings = {
-        's_cfg_Quality': 2.0,
-        'spt_linear_CFG_Quality': 2.0,
-        's_cfg_Fidelity': 1.5,
-        'spt_linear_CFG_Fidelity': 1.5,
-        'edm_steps': 8
-    }
-
-    # Default settings for a normal SDXL model
-    normal_settings = {
-        's_cfg_Quality': 7.5,
-        'spt_linear_CFG_Quality': 4.0,
-        's_cfg_Fidelity': 4.0,
-        'spt_linear_CFG_Fidelity': 1.0,
-        'edm_steps': 50
-    }
-
-    # Choose the settings based on the model type
-    settings = lightning_settings if 'Lightning' in model_type else normal_settings
-
-    if param_setting == "Quality":
-        s_cfg = settings['s_cfg_Quality']
-        spt_linear_CFG = settings['spt_linear_CFG_Quality']
-    else:
-        s_cfg = settings['s_cfg_Fidelity']
-        spt_linear_CFG = settings['spt_linear_CFG_Fidelity']
-
-    return gr.update(value=s_cfg), gr.update(value=spt_linear_CFG), gr.update(value=settings['edm_steps'])
-
-
 def read_image_metadata(image_path):
     if image_path is None:
         return
@@ -507,7 +469,3 @@ def submit_feedback(evt_id, f_score, f_text):
         return 'Submit failed, the server is not set to log history.'
 
 
-def refresh_models_click():
-    from gradio_demo import args
-    new_model_list = list_models(args.ckpt_dir, args.ckpt)
-    return gr.update(choices=new_model_list)
