@@ -1561,7 +1561,7 @@ with (block):
                             random_seed_checkbox = gr.Checkbox(label="Randomize Seed", value=True)
                     with gr.Row():
                         edm_steps_slider = gr.Slider(label="Steps", minimum=1, maximum=200, value=50, step=1)
-                        s_cfg_slider = gr.Slider(label="Text Guidance Scale", minimum=1.0, maximum=15.0, value=7.5,
+                        s_cfg_slider = gr.Slider(label="Text Guidance Scale", minimum=1.0, maximum=15.0, value=3.0,
                                                  step=0.1)
                         s_stage2_slider = gr.Slider(label="Stage2 Guidance Strength", minimum=0., maximum=1., value=1.,
                                                     step=0.05)
@@ -1570,7 +1570,7 @@ with (block):
                                                     step=1.0)
                         seed_slider = gr.Slider(label="Seed", minimum=-1, maximum=2147483647, step=1, randomize=True)
                         sampler_dropdown = gr.Dropdown(label="Sampler", choices=["EDM", "DPMPP2M"],
-                                                       value="DPMPP2M")
+                                                       value="EDM")
                         s_churn_slider = gr.Slider(label="S-Churn", minimum=0, maximum=40, value=5, step=1)
                         s_noise_slider = gr.Slider(label="S-Noise", minimum=1.0, maximum=1.1, value=1.003, step=0.001)
 
