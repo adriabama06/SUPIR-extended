@@ -15,6 +15,7 @@ llava/model/language_model/__pycache__/
 llava/model/language_model/mpt/__pycache__/
 llava/model/multimodal_encoder/__pycache__/
 llava/model/multimodal_projector/__pycache__/
+models/
 sgm/__pycache__/
 sgm/models/__pycache__/
 sgm/modules/__pycache__/
