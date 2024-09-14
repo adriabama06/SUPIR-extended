@@ -35,7 +35,7 @@ from SUPIR.utils.status_container import StatusContainer, MediaData
 from llava.llava_agent import LLavaAgent
 from ui_helpers import is_video, extract_video, compile_video, is_image, get_video_params, printt
 
-SUPIR_REVISION = "v51"
+SUPIR_REVISION = "v52"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--ip", type=str, default='127.0.0.1', help="IP address for the server to listen on.")
