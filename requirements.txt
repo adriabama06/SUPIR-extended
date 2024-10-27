@@ -39,11 +39,11 @@ webdataset==0.2.86
 fastapi==0.111.0
 diffusers
 facexlib==0.3.0
-torch==2.4.1
+torch==2.5.0
 torchvision
 torchaudio
 huggingface_hub
-xformers==0.0.28.post1
+xformers==0.0.28.post2
 # Only for windows
 https://huggingface.co/MonsterMMORPG/SECourses/resolve/main/triton-2.1.0-cp310-cp310-win_amd64.whl ; platform_system == "Windows"
 
