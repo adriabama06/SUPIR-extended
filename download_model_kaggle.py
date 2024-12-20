@@ -1,6 +1,3 @@
-!pip install tqdm huggingface_hub
-!apt-get install aria2
-
 import os
 import requests
 from tqdm import tqdm
