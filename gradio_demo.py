@@ -10,6 +10,7 @@ import traceback
 import json
 from datetime import datetime
 from typing import Tuple, List, Any, Dict
+import subprocess
 
 import einops
 import gradio as gr
@@ -208,18 +209,18 @@ def refresh_styles_click():
     return gr.update(choices=style_list)
 
 
-def update_start_time(src_file, upscale_size, start_time):
+def update_start_time(src_file, upscale_size, max_megapixels, max_resolution, start_time):
     global video_start
     video_start = start_time
-    target_res_text = update_target_resolution(src_file, upscale_size)
-    return gr.update(value=target_res_text, visible=target_res_text != "")
+    target_res_text = update_target_resolution(src_file, upscale_size, max_megapixels, max_resolution)
+    return gr.update(value=target_res_text, visible=True)
 
 
-def update_end_time(src_file, upscale_size, end_time):
+def update_end_time(src_file, upscale_size, max_megapixels, max_resolution, end_time):
     global video_end
     video_end = end_time
-    target_res_text = update_target_resolution(src_file, upscale_size)
-    return gr.update(value=target_res_text, visible=target_res_text != "")
+    target_res_text = update_target_resolution(src_file, upscale_size, max_megapixels, max_resolution)
+    return gr.update(value=target_res_text, visible=True)
 
 
 def select_style(style_name, current_prompt=None, values=False):
@@ -242,8 +243,10 @@ def open_folder():
     open_folder_path = os.path.abspath(args.outputs_folder)
     if platform.system() == "Windows":
         os.startfile(open_folder_path)
-    elif platform.system() == "Linux":
-        os.system(f'xdg-open "{open_folder_path}"')
+    elif platform.system() == "Darwin":  # macOS
+        subprocess.run(["open", open_folder_path])
+    else:  # Linux and other Unix-like
+        subprocess.run(["xdg-open", open_folder_path])
 
 
 def set_info_attributes(elements_to_set: Dict[str, Any]):
@@ -495,7 +498,7 @@ def update_model_settings(model_type, param_setting):
     return gr.update(value=s_cfg), gr.update(value=spt_linear_CFG), gr.update(value=settings['edm_steps'])
 
 
-def update_inputs(input_file, upscale_amount):
+def update_inputs(input_file, upscale_amount, max_megapixels, max_resolution):
     global current_video_fps, total_video_frames, video_start, video_end
     file_input = gr.update(visible=True)
     image_input = gr.update(visible=False, sources=[])
@@ -513,7 +516,7 @@ def update_inputs(input_file, upscale_amount):
     if is_image(input_file):
         image_input = gr.update(visible=True, value=input_file, sources=[], label="Input Image")
         file_input = gr.update(visible=False)
-        target_res = update_target_resolution(input_file, upscale_amount)
+        target_res = update_target_resolution(input_file, upscale_amount, max_megapixels, max_resolution)
         res_output = gr.update(value=target_res, visible=target_res != "")
     elif is_video(input_file):
         video_attributes = ui_helpers.get_video_params(input_file)
@@ -531,65 +534,156 @@ def update_inputs(input_file, upscale_amount):
         image_input = gr.update(visible=True, value=video_frame, sources=[], label="Input Video")
         file_input = gr.update(visible=False)
         video_fps = gr.update(value=current_video_fps)
-        target_res = update_target_resolution(input_file, upscale_amount)
+        target_res = update_target_resolution(input_file, upscale_amount, max_megapixels, max_resolution)
         res_output = gr.update(value=target_res, visible=target_res != "")
     elif input_file is None:
         file_input = gr.update(visible=True, value=None)
     return file_input, image_input, video_slider, res_output, video_start_time, video_end_time, video_current_time, video_fps, video_total_frames
 
 
-def update_target_resolution(img, do_upscale):
+def update_target_resolution(img, do_upscale, max_megapixels=0, max_resolution=0):
     global last_input_path, last_video_params
+    
+    # Debug message at the start of resolution calculation
+    #print(f"Calculating resolution: upscale={do_upscale}, max_mp={max_megapixels}, max_res={max_resolution}")
+    
     if img is None:
         last_video_params = None
         last_input_path = None
         return ""
-    if is_image(img):
-        last_input_path = img
-        last_video_params = None
-        with Image.open(img) as img:
-            width, height = img.size
-            width_org, height_org = img.size
-    elif is_video(img):
-        if img == last_input_path:
-            params = last_video_params
-        else:
+        
+    try:
+        if is_image(img):
             last_input_path = img
-            params = get_video_params(img)
-            last_video_params = params
-        width, height = params['width'], params['height']
-        width_org, height_org = params['width'], params['height']
-    else:
-        last_input_path = None
-        last_video_params = None
-        return ""
+            last_video_params = None
+            with Image.open(img) as img_obj:
+                width, height = img_obj.size
+                width_org, height_org = img_obj.size
+                #print(f"Image dimensions: {width}x{height}")
+        elif is_video(img):
+            if img == last_input_path:
+                params = last_video_params
+            else:
+                last_input_path = img
+                params = get_video_params(img)
+                last_video_params = params
+            width, height = params['width'], params['height']
+            width_org, height_org = params['width'], params['height']
+            print(f"Video dimensions: {width}x{height}")
+        else:
+            last_input_path = None
+            last_video_params = None
+            print(f"Invalid media type: {type(img)}")
+            return ""
 
-    width *= do_upscale
-    height *= do_upscale
+        # Calculate aspect ratio for maintaining proportion
+        aspect_ratio = width / height
+        
+        # Apply standard upscale factor first
+        width *= do_upscale
+        height *= do_upscale
+        #print(f"After upscale: {width}x{height}")
 
-    if min(width, height) < 1024:
-        do_upscale_factor = 1024 / min(width, height)
-        width *= do_upscale_factor
-        height *= do_upscale_factor
+        # Store dimensions before applying minimum constraints (for detection purposes)
+        width_before_min = width
+        height_before_min = height
 
-    output_lines = [
-        f"<td style='padding: 8px; border-bottom: 1px solid #ddd;'>Input: {int(width_org)}x{int(height_org)} px, {width_org * height_org / 1e6:.2f} Megapixels</td>",
-        f"<td style='padding: 8px; border-bottom: 1px solid #ddd;'>Estimated Output Resolution: {int(width)}x{int(height)} px, {width * height / 1e6:.2f} Megapixels</td>",
-    ]
+        # Default minimal resolution check
+        if min(width, height) < 1024:
+            do_upscale_factor = 1024 / min(width, height)
+            width *= do_upscale_factor
+            height *= do_upscale_factor
+            #print(f"After min size adjustment: {width}x{height}")
+        
+        # Apply max megapixels limit if specified
+        if max_megapixels > 0:
+            current_megapixels = width * height / 1_000_000
+            #print(f"Current MP: {current_megapixels}, Max allowed: {max_megapixels}")
+            if current_megapixels > max_megapixels:
+                scale_factor = (max_megapixels * 1_000_000 / (width * height)) ** 0.5
+                width *= scale_factor
+                height *= scale_factor
+                #print(f"After max MP adjustment: {width}x{height}")
+                
+                # Re-apply minimum resolution check after max megapixels constraint
+                if min(width, height) < 1024:
+                    min_scale_factor = 1024 / min(width, height)
+                    width *= min_scale_factor
+                    height *= min_scale_factor
+        
+        # Apply max resolution limit if specified
+        if max_resolution > 0:
+            #print(f"Max resolution: {max_resolution}, Current max dimension: {max(width, height)}")
+            if max(width, height) > max_resolution:
+                if width > height:
+                    scale_factor = max_resolution / width
+                else:
+                    scale_factor = max_resolution / height
+                width *= scale_factor
+                height *= scale_factor
+                #print(f"After max resolution adjustment: {width}x{height}")
+                
+                # Re-apply minimum resolution check after max resolution constraint
+                if min(width, height) < 1024:
+                    min_scale_factor = 1024 / min(width, height)
+                    width *= min_scale_factor
+                    height *= min_scale_factor
 
-    if total_video_frames > 0 and is_video(img):
-        selected_video_frames = video_end - video_start
-        total_video_time = int(selected_video_frames / current_video_fps)
-        output_lines += [
-            f"<td style='padding: 8px; border-bottom: 1px solid #ddd;'>Selected video frames: {selected_video_frames}</td>",
-            f"<td style='padding: 8px; border-bottom: 1px solid #ddd;'>Total video time: {total_video_time} seconds</td>"
+        # Round dimensions to multiples of 32 to match upscale_image function
+        unit_resolution = 32
+        width = int(np.round(width / unit_resolution)) * unit_resolution
+        height = int(np.round(height / unit_resolution)) * unit_resolution
+        #print(f"After unit resolution adjustment: {width}x{height}")
+
+        output_lines = [
+            f"<td style='padding: 8px; border-bottom: 1px solid #ddd;'>Input: {int(width_org)}x{int(height_org)} px, {width_org * height_org / 1e6:.2f} Megapixels</td>",
+            f"<td style='padding: 8px; border-bottom: 1px solid #ddd;'>Estimated Output Resolution: {int(width)}x{int(height)} px, {width * height / 1e6:.2f} Megapixels</td>",
         ]
 
-    output = '<table style="width:100%;"><tr>'
-    # Fix here: Convert each pair of <td> elements into a single string before joining
-    output += ''.join(''.join(output_lines[i:i + 2]) for i in range(0, len(output_lines), 2))
-    output += '</tr></table>'
-    return output
+        # Add a note if minimum size enforcement had to override max resolution or max megapixels constraints
+        resized_due_to_max_constraints = False
+        
+        # Check if max megapixels constraint would've made it smaller than 1024px
+        if max_megapixels > 0:
+            potential_mp_megapixels = (width_before_min * height_before_min) / 1_000_000
+            if potential_mp_megapixels > max_megapixels:
+                potential_scale = (max_megapixels * 1_000_000 / (width_before_min * height_before_min)) ** 0.5
+                potential_w = width_before_min * potential_scale
+                potential_h = height_before_min * potential_scale
+                if min(potential_w, potential_h) < 1024:
+                    resized_due_to_max_constraints = True
+        
+        # Check if max resolution constraint would've made it smaller than 1024px
+        if max_resolution > 0:
+            if max(width_before_min, height_before_min) > max_resolution:
+                scale = max_resolution / max(width_before_min, height_before_min)
+                potential_w = width_before_min * scale
+                potential_h = height_before_min * scale
+                if min(potential_w, potential_h) < 1024:
+                    resized_due_to_max_constraints = True
+        
+        # if resized_due_to_max_constraints:
+        #     output_lines.append(f"<td style='padding: 8px; border-bottom: 1px solid #ddd; color: #ff6600;'><b>Note:</b> Resolution was adjusted to maintain minimum 1024px for smallest dimension</td>")
+        
+        if total_video_frames > 0 and is_video(img):
+            selected_video_frames = video_end - video_start
+            total_video_time = int(selected_video_frames / current_video_fps)
+            output_lines += [
+                f"<td style='padding: 8px; border-bottom: 1px solid #ddd;'>Selected video frames: {selected_video_frames}</td>",
+                f"<td style='padding: 8px; border-bottom: 1px solid #ddd;'>Total video time: {total_video_time} seconds</td>"
+            ]
+
+        output = '<table style="width:100%;"><tr>'
+        # Convert each pair of <td> elements into a single string before joining
+        output += ''.join(''.join(output_lines[i:i + 2]) for i in range(0, len(output_lines), 2))
+        output += '</tr></table>'
+        #print(f"Generated output HTML")
+        return output
+    except Exception as e:
+        #print(f"Error in update_target_resolution: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return f"<p>Error calculating resolution: {str(e)}</p>"
 
 
 def read_image_metadata(image_path):
@@ -851,6 +945,20 @@ def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions
     for md in inputs:
         img = md.media_data
         img_path = md.media_path
+        
+        # Check if filename.txt exists - if it does, skip LLaVA processing for this image
+        txt_path = os.path.splitext(img_path)[0] + ".txt"
+        if os.path.exists(txt_path):
+            printt(f"Found {txt_path}, skipping LLaVA for this image")
+            # Read caption from the text file instead
+            with open(txt_path, 'r') as f:
+                caption = f.read().strip()
+            md.caption = caption
+            outputs.append(md)
+            step += 1
+            progress(step / total_steps, desc=f"Skipped LLaVA for image {step}/{len(inputs)}, using existing text file")
+            continue
+            
         progress(step / total_steps, desc=f"Processing image {step}/{len(inputs)} with LLaVA...")
         if img is None:  ## this is for llava and video
             img = Image.open(img_path)
@@ -876,13 +984,13 @@ def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions
 
 # video_start_time_number, video_current_time_number, video_end_time_number,
 #                      video_fps_number, video_total_frames_number, src_input_file, upscale_slider
-def update_video_slider(start_time, current_time, end_time, fps, total_frames, src_file, upscale_size):
+def update_video_slider(start_time, current_time, end_time, fps, total_frames, src_file, upscale_size, max_megapixels, max_resolution):
     print(f"Updating video slider: {start_time}, {current_time}, {end_time}, {fps}, {src_file}")
     global video_start, video_end
     video_start = start_time
     video_end = end_time
     video_frame = ui_helpers.get_video_frame(src_file, current_time)
-    target_res_text = update_target_resolution(src_file, upscale_size)
+    target_res_text = update_target_resolution(src_file, upscale_size, max_megapixels, max_resolution)
     return gr.update(value=video_frame), gr.update(value=target_res_text, visible=target_res_text != "")
 
 
@@ -891,7 +999,7 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                   s_stage1, s_stage2, s_cfg, seed, sampler, s_churn, s_noise, color_fix_type, diff_dtype, ae_dtype,
                   linear_cfg, linear_s_stage2, spt_linear_cfg, spt_linear_s_stage2, model_select,
                   ckpt_select, num_images, random_seed, apply_llava, face_resolution, apply_bg, apply_face,
-                  face_prompt, dont_update_progress=False, unload=True,
+                  face_prompt, max_megapixels, max_resolution, dont_update_progress=False, unload=True,
                   progress=gr.Progress()):
     global model, status_container, event_id
     main_begin_time = time.time()
@@ -941,7 +1049,41 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
 
         img = HWC3(img)
         printt("Upscaling image (pre)...")
-        img = upscale_image(img, upscale, unit_resolution=32, min_size=1024)
+        
+        # Calculate final upscale factor based on constraints
+        h, w, _ = img.shape
+        target_h = h * upscale
+        target_w = w * upscale
+        
+        # Apply minimum resolution
+        if min(target_h, target_w) < 1024:
+            min_scale = 1024 / min(target_h, target_w)
+            target_h *= min_scale
+            target_w *= min_scale
+        
+        # Apply max megapixels constraint if specified
+        if max_megapixels > 0:
+            target_mp = (target_h * target_w) / 1_000_000
+            if target_mp > max_megapixels:
+                mp_scale = (max_megapixels * 1_000_000 / (target_h * target_w)) ** 0.5
+                target_h *= mp_scale
+                target_w *= mp_scale
+        
+        # Apply max resolution constraint if specified
+        if max_resolution > 0:
+            if max(target_h, target_w) > max_resolution:
+                if target_w > target_h:
+                    res_scale = max_resolution / target_w
+                else:
+                    res_scale = max_resolution / target_h
+                target_h *= res_scale
+                target_w *= res_scale
+        
+        # Calculate final upscale factor
+        final_upscale = min(target_h / h, target_w / w)
+        printt(f"Final upscale factor: {final_upscale:.2f}")
+        
+        img = upscale_image(img, final_upscale, unit_resolution=32, min_size=1024)
 
         lq = np.array(img)
         lq = lq / 255 * 2 - 1
@@ -964,7 +1106,8 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
             face_helper.align_warp_face()
 
             lq = lq / 255 * 2 - 1
-            lq = torch.tensor(lq, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(SUPIR_device)[:, :3, :, :]
+            lq = torch.tensor(lq, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(SUPIR_device)[:, :3,
+                           :, :]
 
             if len(face_prompt) > 1:
                 face_captions = [face_prompt]
@@ -1090,7 +1233,7 @@ def batch_process(img_data,
                   diff_dtype, edm_steps, face_prompt, face_resolution, linear_CFG, linear_s_stage2,
                   make_comparison_video, model_select, n_prompt, num_images, num_samples, qs, random_seed,
                   s_cfg, s_churn, s_noise, s_stage1, s_stage2, sampler, save_captions, seed, spt_linear_CFG,
-                  spt_linear_s_stage2, temperature, top_p, upscale, auto_unload_llava, progress=gr.Progress()
+                  spt_linear_s_stage2, temperature, top_p, upscale, max_megapixels, max_resolution, auto_unload_llava, progress=gr.Progress()
                   ):
     global is_processing, llava_agent, model, status_container
     ckpt_select = get_ckpt_path(ckpt_select)
@@ -1158,7 +1301,7 @@ def batch_process(img_data,
                                     linear_CFG, linear_s_stage2, spt_linear_CFG, spt_linear_s_stage2, model_select,
                                     ckpt_select,
                                     num_images, random_seed, apply_llava, face_resolution, apply_bg, apply_face,
-                                    face_prompt, unload=True, progress=progress)
+                                    face_prompt, max_megapixels, max_resolution, unload=True, progress=progress)
         printt("Processing images (Stage 2) Completed")
     counter += total_supir_steps
     progress(counter / total_steps, desc="Processing completed.")
@@ -1453,6 +1596,8 @@ selected_pos, selected_neg, llava_style_prompt = select_style(
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
 
 with (block):
+    gr.Markdown("SUPIR V62 - https://www.patreon.com/posts/99176057")
+        
     with gr.Tab("Upscale"):
         # Execution buttons
         with gr.Column(scale=1):
@@ -1460,15 +1605,14 @@ with (block):
                 start_single_button = gr.Button(value="Process Single")
                 start_batch_button = gr.Button(value="Process Batch")
                 stop_batch_button = gr.Button(value="Cancel")
-                if args.outputs_folder_button:
-                    btn_open_outputs = gr.Button("Open Outputs Folder")
-                    btn_open_outputs.click(fn=open_folder)
+                btn_open_outputs = gr.Button("Open Outputs Folder")
+                btn_open_outputs.click(fn=open_folder)
 
         with gr.Column(scale=1):
             with gr.Row():
                 output_label = gr.Label(label="Progress", elem_classes=["progress_label"])
             with gr.Row():
-                target_res_textbox = gr.HTML(value="", visible=False, show_label=False)
+                target_res_textbox = gr.HTML(value="", visible=True, show_label=False)
         with gr.Row(equal_height=True):
             with gr.Column(elem_classes=['preview_col']) as input_col:
                 src_input_file = gr.File(type="filepath", label="Input", elem_id="file-input",
@@ -1513,10 +1657,20 @@ with (block):
                         populate_gallery_button.click(fn=populate_gallery, outputs=[result_gallery, result_slider],
                                                       show_progress=True, queue=True)
                     with gr.Row():
-                        upscale_slider = gr.Slider(label="Upscale Size", minimum=1, maximum=20, value=1, step=0.1)
+                        upscale_slider = gr.Slider(label="Upscale Size", minimum=1, maximum=20, value=1, step=0.1,
+                                                  info="Base upscale factor. Image will be scaled by this amount, then constrained by Max Megapixels and Max Resolution if set.")
+                    with gr.Row():
+                        max_mp_slider = gr.Slider(label="Max Megapixels (0 = no limit)", minimum=0, maximum=100, value=0, step=1,
+                                                 info="Limit output megapixels. Output will be constrained by Max Megapixels and Max Resolution if set. Note: Minimum dimension will always be at least 1024px.",
+                                                 interactive=True)
+                        max_res_slider = gr.Slider(label="Max Resolution (0 = no limit)", minimum=0, maximum=8192, value=0, step=64,
+                                                  info="Limit maximum resolution (width or height). Higher values may cause out-of-memory issues. Note: Minimum dimension will always be at least 1024px.",
+                                                  interactive=True)
                     with gr.Row():
                         apply_llava_checkbox = gr.Checkbox(label="Apply LLaVa", value=False)
                         apply_supir_checkbox = gr.Checkbox(label="Apply SUPIR", value=True)
+                        ckpt_type = gr.Dropdown(label="Checkpoint Type", choices=["Standard SDXL", "SDXL Lightning"],
+                                                value="Standard SDXL")
                     with gr.Row():
                         with gr.Column():
                             prompt_style_dropdown = gr.Dropdown(label="Prompt Style",
@@ -1537,7 +1691,7 @@ with (block):
                         ckpt_type = gr.Dropdown(label="Checkpoint Type", choices=["Standard SDXL", "SDXL Lightning"],
                                                 value="Standard SDXL")
 
-                    prompt_textbox = gr.Textbox(label="Prompt", value="")
+                    prompt_textbox = gr.Textbox(label="Prompt", value="", lines=4)
                     face_prompt_textbox = gr.Textbox(label="Face Prompt",
                                                      placeholder="Optional, uses main prompt if not provided",
                                                      value="")
@@ -1587,6 +1741,10 @@ with (block):
 
             with gr.Column():
                 with gr.Accordion("Batch options", open=True):
+                    with gr.Row():
+                        # Add Open Outputs Folder button
+                        btn_open_outputs = gr.Button("Open Outputs Folder")
+                        btn_open_outputs.click(fn=open_folder)
                     with gr.Row():
                         with gr.Column():
                             batch_process_folder_textbox = gr.Textbox(
@@ -1835,6 +1993,8 @@ with (block):
         "linear_s_stage2": linear_s_stage2_checkbox,
         "main_prompt": prompt_textbox,
         "make_comparison_video": make_comparison_video_checkbox,
+        "max_megapixels": max_mp_slider,
+        "max_resolution": max_res_slider,
         "model_select": model_select_radio,
         "n_prompt": n_prompt_textbox,
         "num_images": num_images_slider,
@@ -1904,8 +2064,17 @@ with (block):
     make_comparison_video_checkbox.change(fn=toggle_compare_elements, inputs=[make_comparison_video_checkbox],
                                           outputs=[comparison_video_col, compare_video_row, comparison_video])
     submit_button.click(fn=submit_feedback, inputs=[event_id, fb_score, fb_text], outputs=[fb_text])
-    upscale_slider.change(fn=update_target_resolution, inputs=[src_image_display, upscale_slider],
+    upscale_slider.change(fn=update_target_resolution, inputs=[src_image_display, upscale_slider, max_mp_slider, max_res_slider],
                           outputs=[target_res_textbox])
+    
+    # Remove previous handlers that aren't working
+    # Add new handlers with explicit update logic
+    max_mp_slider.change(fn=update_target_resolution, 
+                         inputs=[src_image_display, upscale_slider, max_mp_slider, max_res_slider],
+                         outputs=[target_res_textbox])
+    max_res_slider.change(fn=update_target_resolution, 
+                         inputs=[src_image_display, upscale_slider, max_mp_slider, max_res_slider],
+                         outputs=[target_res_textbox])
 
     # slider_dl_button.click(fn=download_slider_image, inputs=[result_slider], show_progress=False, queue=True)
     slider_full_button.click(fn=toggle_full_preview, outputs=[result_col, slider_full_button, slider_dl_button],
@@ -1914,9 +2083,9 @@ with (block):
     input_elements = [src_input_file, src_image_display, video_slider_display, target_res_textbox,
                       video_start_time_number, video_end_time_number, video_current_time_number, video_fps_number,
                       video_total_frames_number]
-    src_input_file.change(fn=update_inputs, inputs=[src_input_file, upscale_slider],
+    src_input_file.change(fn=update_inputs, inputs=[src_input_file, upscale_slider, max_mp_slider, max_res_slider],
                           outputs=input_elements)
-    src_image_display.clear(fn=update_inputs, inputs=[src_image_display, upscale_slider],
+    src_image_display.clear(fn=update_inputs, inputs=[src_image_display, upscale_slider, max_mp_slider, max_res_slider],
                             outputs=input_elements)
 
     model_settings_elements = [s_cfg_slider, spt_linear_cfg_slider, edm_steps_slider]
@@ -1925,13 +2094,13 @@ with (block):
                      outputs=model_settings_elements)
 
     video_sliders = [video_start_time_number, video_current_time_number, video_end_time_number,
-                     video_fps_number, video_total_frames_number, src_input_file, upscale_slider]
+                     video_fps_number, video_total_frames_number, src_input_file, upscale_slider, max_mp_slider, max_res_slider]
     video_current_time_number.change(fn=update_video_slider, inputs=video_sliders,
                                      outputs=[src_image_display, target_res_textbox], js="update_slider")
     video_start_time_number.change(fn=update_start_time,
-                                   inputs=[src_input_file, upscale_slider, video_start_time_number],
+                                   inputs=[src_input_file, upscale_slider, max_mp_slider, max_res_slider, video_start_time_number],
                                    outputs=target_res_textbox)
-    video_end_time_number.change(fn=update_end_time, inputs=[src_input_file, upscale_slider, video_end_time_number],
+    video_end_time_number.change(fn=update_end_time, inputs=[src_input_file, upscale_slider, max_mp_slider, max_res_slider, video_end_time_number],
                                  outputs=target_res_textbox)
 
     save_preset_button.click(fn=save_current_preset, inputs=[preset_name_textbox]+elements+elements_extra, outputs=[output_label])
