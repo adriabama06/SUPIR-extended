@@ -1690,7 +1690,7 @@ with (block):
                                                       show_progress=True, queue=True)
                     with gr.Row():
                         upscale_slider = gr.Slider(label="Upscale Size", minimum=1, maximum=20, value=1, step=0.1,
-                                                  info="Base upscale factor. Image will be scaled by this amount, then constrained by Max Megapixels and Max Resolution if set. Set like 100x and limit resolution with Max Megapixels and Max Resolution if you need.")
+                                                  info="Base upscale factor. Image will be scaled by this amount, then constrained by Max Megapixels and Max Resolution if set. Set like 20x upscale and limit resolution with Max Megapixels and Max Resolution if you need.")
                     with gr.Row():
                         max_mp_slider = gr.Slider(label="Max Megapixels (0 = no limit)", minimum=0, maximum=100, value=0, step=1,
                                                  info="Limit output megapixels. Output will be constrained by Max Megapixels and Max Resolution if set. Note: Minimum dimension will always be at least 1024px.",
