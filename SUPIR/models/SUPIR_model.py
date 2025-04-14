@@ -95,6 +95,19 @@ class SUPIRModel(DiffusionEngine):
         if not sampler_cls:
             sampler_cls = f"sgm.modules.diffusionmodules.sampling.RestoreDPMPP2MSampler"
 
+        # Extract cancellation check function if provided
+        is_cancelled = kwargs.get('is_cancelled', lambda: False)
+        
+        # Create clean kwargs without is_cancelled for denoiser
+        kwargs_clean = kwargs.copy()
+        if 'is_cancelled' in kwargs_clean:
+            kwargs_clean.pop('is_cancelled')
+        
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
+
         n = len(x)
         if num_samples > 1:
             assert n == 1
@@ -106,6 +119,12 @@ class SUPIRModel(DiffusionEngine):
             p_p = self.p_p
         if n_p == 'default':
             n_p = self.n_p
+            
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
+            
         new_sampler_config = {
             "target": sampler_cls,
             "params": {
@@ -136,34 +155,91 @@ class SUPIRModel(DiffusionEngine):
             self.previous_sampler_config = new_sampler_config
             printt("Instantiated sampler.")
 
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
+            
         if seed == -1:
             seed = random.randint(0, 65535)
         seed_everything(seed)
         
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
         
         printt("Encoding first stage with denoise...")
         _z = self.encode_first_stage_with_denoise(x, use_sample=False)
+        
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
+            
         printt("Encoded first stage with denoise...")
         x_stage1 = self.decode_first_stage(_z)
+        
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
+            
         printt("Decoded first stage...")
         z_stage1 = self.encode_first_stage(x_stage1)
+        
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
+            
         printt("Encoded first stage...")
 
         c, uc = self.prepare_condition(_z, p, p_p, n_p, n)
 
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
+            
         printt("Loading denoiser.")
+        # Create a lambda function that doesn't include is_cancelled in its args
         denoiser = lambda input, sigma, c, control_scale: self.denoiser(
-            self.model, input, sigma, c, control_scale, **kwargs
+            self.model, input, sigma, c, control_scale, **kwargs_clean
         )
         printt("Loaded denoiser.")
 
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
+            
         noised_z = torch.randn_like(_z).to(_z.device)
         printt("Sampling...")
+        
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
+            
+        # Pass is_cancelled to the sampler but not to the denoiser
         _samples = self.sampler(denoiser, noised_z, cond=c, uc=uc, x_center=z_stage1, control_scale=control_scale,
-                                use_linear_control_scale=use_linear_control_scale,
-                                control_scale_start=control_scale_start)
+                               use_linear_control_scale=use_linear_control_scale,
+                               control_scale_start=control_scale_start, is_cancelled=is_cancelled)
+                                
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
+            
         printt("Sampled.")
         output = self.decode_first_stage(_samples)
+        
+        # Check for cancellation
+        if is_cancelled():
+            printt("Process cancelled, aborting batchify_sample")
+            return None
+            
         printt("Decoded output.")
         if color_fix_type == 'Wavelet':
             output = wavelet_reconstruction(output, x_stage1)

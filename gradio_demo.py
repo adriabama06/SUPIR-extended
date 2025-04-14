@@ -819,21 +819,19 @@ def populate_gallery():
 
 def start_single_process(*element_values):
     global status_container, is_processing
+    # Ensure we start with a clean processing state
+    is_processing = False
     status_container = StatusContainer()
-    status_container.is_batch = False
     values_dict = zip(elements_dict.keys(), element_values)
     values_dict = dict(values_dict)
-    main_prompt = values_dict['main_prompt']
-    # Delete input_image, prompt, batch_process_folder, outputs_folder from values_dict
+    img_data = []
+    validate_upscale = values_dict.get('upscale', 1) > 1 or values_dict.get('apply_face', False) or values_dict.get('apply_bg', False)
 
     input_image = values_dict['src_file']
     if input_image is None:
         return "No input image provided."
 
     image_files = [input_image]
-
-    # Make a dictionary to store the image data and path
-    img_data = []
 
     if is_video(input_image):
         # Store the original video path for later
@@ -851,7 +849,7 @@ def start_single_process(*element_values):
         for file in os.listdir(extracted_folder):
             full_path = os.path.join(extracted_folder, file)
             media_data = MediaData(media_path=full_path)
-            media_data.caption = main_prompt
+            media_data.caption = values_dict['main_prompt']
             img_data.append(media_data)
     else:
         for file in image_files:
@@ -859,7 +857,7 @@ def start_single_process(*element_values):
                 media_data = MediaData(media_path=file)
                 img = Image.open(file)
                 media_data.media_data = np.array(img)
-                media_data.caption = main_prompt
+                media_data.caption = values_dict['main_prompt']
                 img_data.append(media_data)
             except:
                 pass
@@ -883,6 +881,8 @@ def start_single_process(*element_values):
 
 def start_batch_process(*element_values):
     global status_container, is_processing
+    # Ensure we start with a clean processing state
+    is_processing = False
     status_container = StatusContainer()
     status_container.is_batch = True
     values_dict = zip(elements_dict.keys(), element_values)
@@ -1125,13 +1125,28 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
             start_time = time.time()  # Track the start time
 
             def process_sample(model, input_data, caption, face_resolution=None, is_face=False):
+                # Check if processing was canceled
+                global is_processing
+                if not is_processing:
+                    printt("Process cancelled before starting sample processing")
+                    return None
+                
+                # Create a cancellation check function that will be passed to the model
+                def is_cancelled():
+                    return not is_processing
+                
                 samples = model.batchify_sample(input_data, caption, num_steps=edm_steps, restoration_scale=s_stage1,
-                                                s_churn=s_churn, s_noise=s_noise, cfg_scale=s_cfg,
-                                                control_scale=s_stage2, seed=seed,
-                                                num_samples=num_samples, p_p=a_prompt, n_p=n_prompt,
-                                                color_fix_type=color_fix_type,
-                                                use_linear_cfg=linear_cfg, use_linear_control_scale=linear_s_stage2,
-                                                cfg_scale_start=spt_linear_cfg, control_scale_start=spt_linear_s_stage2, sampler_cls=sampler)
+                                            s_churn=s_churn, s_noise=s_noise, cfg_scale=s_cfg,
+                                            control_scale=s_stage2, seed=seed,
+                                            num_samples=num_samples, p_p=a_prompt, n_p=n_prompt,
+                                            color_fix_type=color_fix_type,
+                                            use_linear_cfg=linear_cfg, use_linear_control_scale=linear_s_stage2,
+                                            cfg_scale_start=spt_linear_cfg, control_scale_start=spt_linear_s_stage2, 
+                                            sampler_cls=sampler, is_cancelled=is_cancelled)
+
+                if samples is None:  # Check if processing was cancelled during model execution
+                    printt("Process cancelled during sample processing or sample processing returned None")
+                    return None
 
                 if is_face and face_resolution < 1024:
                     samples = samples[:, :, 512 - face_resolution // 2:512 + face_resolution // 2,
@@ -1153,6 +1168,9 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                     caption = face_captions[0]  # currently we dont have multiple captions for faces
                     gen_params['face_prompt'] = caption
                     samples = process_sample(model, face, [caption], face_resolution, is_face=True)
+                    if samples is None:
+                        printt("Face processing was cancelled")
+                        continue
                     samples = torch.nn.functional.interpolate(samples, size=face_helper.face_size, mode='bilinear',
                                                               align_corners=False)
                     x_samples = (einops.rearrange(samples,
@@ -1167,6 +1185,9 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
             if apply_bg:
                 caption = [img_prompt]
                 samples = process_sample(model, lq, caption)
+                if samples is None:
+                    printt("Background processing was cancelled")
+                    break
                 _bg = (einops.rearrange(samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().round().clip(0,
                                                                                                                    255).astype(
                     np.uint8)
@@ -1188,6 +1209,9 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                 caption = [img_prompt]
                 print("Batchifying sample...")
                 samples = process_sample(model, lq, caption)
+                if samples is None:
+                    printt("Sample processing was cancelled")
+                    break
                 x_samples = (
                         einops.rearrange(samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().round().clip(
                     0, 255).astype(np.uint8)
@@ -1213,9 +1237,16 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
 
         progress(counter / total_images, desc=f"Image {counter}/{total_images} processed.")
         processed_images = counter
-        # Now break
+        # Check if cancellation was requested
         if not is_processing:
+            printt("Processing canceled, stopping further image processing.")
             break
+        
+        # Check if cancellation was requested before moving to the next image
+        if not is_processing:
+            printt("Processing canceled, stopping further image processing.")
+            break
+
     # Now we update the status container
     status_container.image_data = output_data
     if not is_processing or unload:
@@ -1445,9 +1476,10 @@ def save_compare_video(image_data: MediaData, params):
 
 def stop_batch_upscale(progress=gr.Progress()):
     global is_processing
-    progress(1, f"Stop command giving please wait to stop")
-    print('\n***Stop command giving please wait to stop***\n')
-    is_processing = False
+    is_processing = False  # Immediately set flag to cancel processing
+    progress(1, desc="Cancelling processing... This will take effect immediately.")
+    print('\n*** Cancel command received - processing will stop at the next checkpoint ***\n')
+    return "Processing cancelled. Please wait for current operations to stop..."
 
 
 def load_and_reset(param_setting):
@@ -1596,7 +1628,7 @@ selected_pos, selected_neg, llava_style_prompt = select_style(
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
 
 with (block):
-    gr.Markdown("SUPIR V62 - https://www.patreon.com/posts/99176057")
+    gr.Markdown("SUPIR V63 - https://www.patreon.com/posts/99176057")
         
     with gr.Tab("Upscale"):
         # Execution buttons
@@ -2044,7 +2076,7 @@ with (block):
                               show_progress=True, queue=True)
     start_batch_button.click(fn=start_batch_process, inputs=elements, outputs=output_label,
                              show_progress=True, queue=True)
-    stop_batch_button.click(fn=stop_batch_upscale, show_progress=True, queue=True)
+    stop_batch_button.click(fn=stop_batch_upscale, outputs=output_label, show_progress=True, queue=True)
     reset_button.click(fn=load_and_reset, inputs=[param_setting_select],
                        outputs=[edm_steps_slider, s_cfg_slider, s_stage2_slider, s_stage1_slider, s_churn_slider,
                                 s_noise_slider, a_prompt_textbox, n_prompt_textbox,
