@@ -1,5 +1,6 @@
-All Rights of my Gradio app Reserved
+# Ultra Advanced SUPIR App With So Many Features and 1-Click Install
 
-Please use original repo if you are not my Patreon supporter : https://github.com/Fanghua-Yu/SUPIR
+## Download and use : https://www.patreon.com/posts/99176057
 
-This is the place where you can get permission to use your app : https://www.patreon.com/posts/supir-1-click-99176057
+![Uploading screencapture-127-0-0-1-7860-2025-04-14-19_22_58.png…]()
+
