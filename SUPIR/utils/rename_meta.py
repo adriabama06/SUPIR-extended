@@ -1,4 +1,3 @@
-
 def rename_meta_key(key):
     key_mapping = {
         "s_cfg": "Text Guidance Scale",
@@ -22,7 +21,10 @@ def rename_meta_key(key):
         "apply_face": "Face Options Face restoration",
         "apply_llava": "Auto Caption With LLaVA",
         "apply_supir": "Upscale With SUPIR",
-        "ckpt_select": "Used Base Model"
+        "ckpt_select": "Used Base Model",
+        "ckpt_type": "Checkpoint Type",
+        "max_megapixels": "max_megapixels",
+        "max_resolution": "max_resolution"
     }
     return key_mapping.get(key, key)
 
@@ -49,6 +51,9 @@ def rename_meta_key_reverse(key):
         "Face Options Face restoration": "apply_face",
         "Auto Caption With LLaVA": "apply_llava",
         "Upscale With SUPIR": "apply_supir",
-        "Used Base Model": "ckpt_select"
+        "Used Base Model": "ckpt_select",
+        "Checkpoint Type": "ckpt_type",
+        "max_megapixels": "max_megapixels",
+        "max_resolution": "max_resolution"
     }
     return key_mapping.get(key, key)

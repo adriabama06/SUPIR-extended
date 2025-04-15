@@ -113,39 +113,97 @@ shared.opts.fast_load_sd = args.fast_load_sd
 
 
 def apply_metadata(image_path):
+    global elements_dict, extra_info_elements
+    
     if image_path is None:
-        return
+        return [gr.update(value="No image selected")] + [gr.update() for _ in range(len(elements_dict) + len(extra_info_elements))]
 
     # Open the image and extract metadata
-    with Image.open(image_path) as img:
-        metadata = img.info
-        global elements_dict, extra_info_elements
-        updates = []
-        for key, value in metadata.items():
-            # Check if the key is in the dictionary of UI elements
-            if key in elements_dict:
-                if key == "src_file":
-                    # Skip updating the "src_file" element
-                    updates.append(gr.update())
-                else:
-                    # Update the value of the element if it exists and is not "src_file"
-                    elements_dict[key].value = value
-                    updates.append(gr.update(value=elements_dict[key].value))
-            else:
-                # If the key is not found in elements_dict, try to find a matching key using rename_meta_key
-                renamed_key = rename_meta_key(key)
-                if renamed_key in elements_dict:
-                    elements_dict[renamed_key].value = value
-                    updates.append(gr.update(value=elements_dict[renamed_key].value))
-                elif renamed_key in extra_info_elements:
-                    # Update the value of the element in extra_info_elements if it exists
-                    extra_info_elements[renamed_key].value = value
-                    updates.append(gr.update(value=value))
-                else:
-                    # Append an update with no changes if the key is not recognized
-                    updates.append(gr.update())
-
-    return updates
+    try:
+        with Image.open(image_path) as img:
+            metadata = img.info
+           
+            # First update is for output_label
+            all_updates = [gr.update(value=f"Applied metadata from {os.path.basename(image_path)}")]
+            
+            # Add default update for each UI element
+            for _ in elements_dict:
+                all_updates.append(gr.update())
+            for _ in extra_info_elements:
+                all_updates.append(gr.update())
+                
+            # Map to track which elements have been updated
+            updated_elements = set()
+            
+            # Special handling for the caption - look for it first
+            caption_value = None
+            for key in ["Used Final Prompt", "caption"]:
+                if key in metadata:
+                    caption_value = metadata[key]
+                    break
+                    
+            if caption_value and "main_prompt" in elements_dict:
+                # Get the index of main_prompt in the list (add 1 for output_label)
+                main_prompt_index = list(elements_dict.keys()).index("main_prompt") + 1
+                # Set the update for this element
+                all_updates[main_prompt_index] = gr.update(value=caption_value)
+                updated_elements.add("main_prompt")
+                
+            # Process the rest of the metadata
+            for key, value in metadata.items():
+                try:
+                    # Try to use the key directly or find a renamed key
+                    renamed_key = rename_meta_key_reverse(key)
+                    
+                    if renamed_key in elements_dict and renamed_key not in updated_elements:
+                        # Get the index of the element in the list (add 1 for output_label)
+                        index = list(elements_dict.keys()).index(renamed_key) + 1
+                        
+                        # Convert string boolean values to actual booleans for checkboxes
+                        element = elements_dict[renamed_key]
+                        if isinstance(element, gr.Checkbox):
+                            if isinstance(value, str):
+                                if value.lower() == "true":
+                                    value = True
+                                elif value.lower() == "false":
+                                    value = False
+                        # Convert numeric strings to numbers for sliders and number inputs
+                        elif isinstance(element, (gr.Slider, gr.Number)):
+                            try:
+                                if isinstance(value, str):
+                                    if '.' in value:
+                                        value = float(value)
+                                    else:
+                                        value = int(value)
+                            except (ValueError, TypeError):
+                                pass  # Keep as string if conversion fails
+                                
+                        # Set the update for this element
+                        all_updates[index] = gr.update(value=value)
+                        updated_elements.add(renamed_key)
+                    elif renamed_key in extra_info_elements and renamed_key not in updated_elements:
+                        # Get the index in the combined list (after elements_dict and add 1 for output_label)
+                        index = 1 + len(elements_dict) + list(extra_info_elements.keys()).index(renamed_key)
+                        
+                        # Convert string boolean values to actual booleans for checkboxes
+                        element = extra_info_elements[renamed_key]
+                        if isinstance(element, gr.Checkbox):
+                            if isinstance(value, str):
+                                if value.lower() == "true":
+                                    value = True
+                                elif value.lower() == "false":
+                                    value = False
+                        
+                        all_updates[index] = gr.update(value=value)
+                        updated_elements.add(renamed_key)
+                except Exception as e:
+                    print(f"Error processing metadata key {key}: {str(e)}")
+                    continue
+                    
+            return all_updates
+    except Exception as e:
+        print(f"Error opening image or applying metadata: {str(e)}")
+        return [gr.update(value=f"Error: {str(e)}")] + [gr.update() for _ in range(len(elements_dict) + len(extra_info_elements))]
 
 if args.fp8:
     shared.opts.half_mode = args.fp8
@@ -544,8 +602,15 @@ def update_inputs(input_file, upscale_amount, max_megapixels, max_resolution):
 def update_target_resolution(img, do_upscale, max_megapixels=0, max_resolution=0):
     global last_input_path, last_video_params
     
-    # Debug message at the start of resolution calculation
-    #print(f"Calculating resolution: upscale={do_upscale}, max_mp={max_megapixels}, max_res={max_resolution}")
+    # Convert inputs to proper types
+    try:
+        do_upscale = float(do_upscale)
+        max_megapixels = float(max_megapixels) if max_megapixels else 0
+        max_resolution = int(float(max_resolution)) if max_resolution else 0
+    except (ValueError, TypeError):
+        do_upscale = 1.0
+        max_megapixels = 0
+        max_resolution = 0
     
     if img is None:
         last_video_params = None
@@ -575,6 +640,12 @@ def update_target_resolution(img, do_upscale, max_megapixels=0, max_resolution=0
             last_video_params = None
             print(f"Invalid media type: {type(img)}")
             return ""
+
+        # Convert width and height to float for calculations
+        width = float(width)
+        height = float(height)
+        width_org = float(width_org)
+        height_org = float(height_org)
 
         # Calculate aspect ratio for maintaining proportion
         aspect_ratio = width / height
@@ -824,8 +895,13 @@ def start_single_process(*element_values):
     status_container = StatusContainer()
     values_dict = zip(elements_dict.keys(), element_values)
     values_dict = dict(values_dict)
+    
+    # Store ckpt_type in process_params but don't pass to batch_process
+    status_container.process_params = status_container.process_params or {}
+    status_container.process_params['ckpt_type'] = ckpt_type.value
+    
     img_data = []
-    validate_upscale = values_dict.get('upscale', 1) > 1 or values_dict.get('apply_face', False) or values_dict.get('apply_bg', False)
+    validate_upscale = float(values_dict.get('upscale', 1)) > 1 or values_dict.get('apply_face', False) or values_dict.get('apply_bg', False)
 
     input_image = values_dict['src_file']
     if input_image is None:
@@ -865,7 +941,7 @@ def start_single_process(*element_values):
     # auto_unload_llava, batch_process_folder, main_prompt, output_video_format, output_video_quality, outputs_folder,video_duration, video_fps, video_height, video_width
     keys_to_pop = ['batch_process_folder', 'main_prompt', 'output_video_format',
                    'output_video_quality', 'outputs_folder', 'video_duration', 'video_end', 'video_fps',
-                   'video_height', 'video_start', 'video_width', 'src_file']
+                   'video_height', 'video_start', 'video_width', 'src_file', 'ckpt_type']
 
     values_dict['outputs_folder'] = args.outputs_folder
     status_container.process_params = values_dict
@@ -884,30 +960,32 @@ def start_batch_process(*element_values):
     # Ensure we start with a clean processing state
     is_processing = False
     status_container = StatusContainer()
-    status_container.is_batch = True
     values_dict = zip(elements_dict.keys(), element_values)
     values_dict = dict(values_dict)
-    batch_process_folder = values_dict['batch_process_folder']
-    outputs_folder = values_dict['outputs_folder']
-    main_prompt = values_dict['main_prompt']
-    if not batch_process_folder:
+    
+    # Store ckpt_type in process_params but don't pass to batch_process
+    status_container.process_params = status_container.process_params or {}
+    status_container.process_params['ckpt_type'] = ckpt_type.value
+    
+    batch_folder = values_dict.get('batch_process_folder')
+    if not batch_folder:
         return "No input folder provided."
-    if not os.path.exists(batch_process_folder):
+    if not os.path.exists(batch_folder):
         return "The input folder does not exist."
 
-    if len(outputs_folder) < 2:
-        outputs_folder = args.outputs_folder
+    if len(values_dict['outputs_folder']) < 2:
+        values_dict['outputs_folder'] = args.outputs_folder
 
-    image_files = [file for file in os.listdir(batch_process_folder) if
-                   is_image(os.path.join(batch_process_folder, file))]
+    image_files = [file for file in os.listdir(batch_folder) if
+                   is_image(os.path.join(batch_folder, file))]
 
     # Make a dictionary to store the image data and path
     img_data = []
     for file in image_files:
-        media_data = MediaData(media_path=os.path.join(batch_process_folder, file))
-        img = Image.open(os.path.join(batch_process_folder, file))
+        media_data = MediaData(media_path=os.path.join(batch_folder, file))
+        img = Image.open(os.path.join(batch_folder, file))
         media_data.media_data = np.array(img)
-        media_data.caption = main_prompt
+        media_data.caption = values_dict['main_prompt']
         img_data.append(media_data)
 
     # Store it globally
@@ -916,10 +994,10 @@ def start_batch_process(*element_values):
     try:
         keys_to_pop = ['batch_process_folder', 'main_prompt', 'output_video_format',
                        'output_video_quality', 'outputs_folder', 'video_duration', 'video_end', 'video_fps',
-                       'video_height', 'video_start', 'video_width', 'src_file']
+                       'video_height', 'video_start', 'video_width', 'src_file', 'ckpt_type']
 
-        status_container.outputs_folder = outputs_folder
-        values_dict['outputs_folder'] = outputs_folder
+        status_container.outputs_folder = values_dict['outputs_folder']
+        values_dict['outputs_folder'] = values_dict['outputs_folder']
         status_container.process_params = values_dict
 
         values_dict = {k: v for k, v in values_dict.items() if k not in keys_to_pop}
@@ -1003,6 +1081,38 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                   progress=gr.Progress()):
     global model, status_container, event_id
     main_begin_time = time.time()
+    
+    # Ensure all parameters are of the correct type
+    try:
+        num_samples = int(num_samples) if num_samples is not None else 1
+        edm_steps = int(edm_steps) if edm_steps is not None else 50
+        s_stage1 = float(s_stage1) if s_stage1 is not None else -1.0
+        s_stage2 = float(s_stage2) if s_stage2 is not None else 1.0
+        s_cfg = float(s_cfg) if s_cfg is not None else 3.0
+        s_churn = float(s_churn) if s_churn is not None else 5.0
+        s_noise = float(s_noise) if s_noise is not None else 1.003
+        num_images = int(num_images) if num_images is not None else 1
+        face_resolution = int(float(face_resolution)) if face_resolution is not None else 1024
+        
+        # Convert string booleans to actual booleans if needed
+        if isinstance(random_seed, str):
+            random_seed = random_seed.lower() == 'true'
+        if isinstance(apply_llava, str):
+            apply_llava = apply_llava.lower() == 'true'
+        if isinstance(apply_bg, str):
+            apply_bg = apply_bg.lower() == 'true'
+        if isinstance(apply_face, str):
+            apply_face = apply_face.lower() == 'true'
+        if isinstance(linear_cfg, str):
+            linear_cfg = linear_cfg.lower() == 'true'
+        if isinstance(linear_s_stage2, str):
+            linear_s_stage2 = linear_s_stage2.lower() == 'true'
+    except (ValueError, TypeError) as e:
+        print(f"Error converting parameters: {e}")
+        # Provide default values in case of conversion errors
+        if not isinstance(num_samples, int):
+            num_samples = 1
+    
     total_images = len(inputs) * num_images
     total_progress = total_images + 1
     if unload:
@@ -1016,6 +1126,10 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
     progress(counter / total_progress, desc="Model Loaded, Processing Images...")
     model.ae_dtype = convert_dtype('fp32' if bf16_supported == False else ae_dtype)
     model.model.dtype = convert_dtype('fp16' if bf16_supported == False else diff_dtype)
+
+    # Ensure max_megapixels and max_resolution are numbers
+    max_megapixels = float(max_megapixels) if max_megapixels is not None else 0
+    max_resolution = float(max_resolution) if max_resolution is not None else 0
 
     idx = 0
     output_data = []
@@ -1052,8 +1166,8 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
         
         # Calculate final upscale factor based on constraints
         h, w, _ = img.shape
-        target_h = h * upscale
-        target_w = w * upscale
+        target_h = float(h) * float(upscale)
+        target_w = float(w) * float(upscale)
         
         # Apply minimum resolution
         if min(target_h, target_w) < 1024:
@@ -1148,7 +1262,9 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                     printt("Process cancelled during sample processing or sample processing returned None")
                     return None
 
-                if is_face and face_resolution < 1024:
+                # Ensure face_resolution is a number before comparison
+                if is_face and face_resolution is not None and int(face_resolution) < 1024:
+                    face_resolution = int(face_resolution)
                     samples = samples[:, :, 512 - face_resolution // 2:512 + face_resolution // 2,
                               512 - face_resolution // 2:512 + face_resolution // 2]
                 return samples
@@ -1267,12 +1383,49 @@ def batch_process(img_data,
                   spt_linear_s_stage2, temperature, top_p, upscale, max_megapixels, max_resolution, auto_unload_llava, progress=gr.Progress()
                   ):
     global is_processing, llava_agent, model, status_container
+    
+    # Ensure key parameters are of the correct type before processing
+    try:
+        # Convert string values to appropriate types
+        num_images = int(num_images) if isinstance(num_images, str) else num_images
+        num_samples = int(num_samples) if isinstance(num_samples, str) else num_samples
+        edm_steps = int(edm_steps) if isinstance(edm_steps, str) else edm_steps
+        upscale = float(upscale) if isinstance(upscale, str) else upscale
+        max_megapixels = float(max_megapixels) if isinstance(max_megapixels, str) else max_megapixels
+        max_resolution = float(max_resolution) if isinstance(max_resolution, str) else max_resolution
+        face_resolution = int(float(face_resolution)) if isinstance(face_resolution, (str, float)) else face_resolution
+        
+        # Convert string booleans to actual booleans
+        if isinstance(apply_llava, str):
+            apply_llava = apply_llava.lower() == 'true'
+        if isinstance(apply_supir, str):
+            apply_supir = apply_supir.lower() == 'true'
+        if isinstance(apply_bg, str):
+            apply_bg = apply_bg.lower() == 'true'
+        if isinstance(apply_face, str):
+            apply_face = apply_face.lower() == 'true'
+        if isinstance(random_seed, str):
+            random_seed = random_seed.lower() == 'true'
+        if isinstance(linear_CFG, str):
+            linear_CFG = linear_CFG.lower() == 'true'
+        if isinstance(linear_s_stage2, str):
+            linear_s_stage2 = linear_s_stage2.lower() == 'true'
+        if isinstance(make_comparison_video, str):
+            make_comparison_video = make_comparison_video.lower() == 'true'
+        if isinstance(save_captions, str):
+            save_captions = save_captions.lower() == 'true'
+        if isinstance(auto_unload_llava, str):
+            auto_unload_llava = auto_unload_llava.lower() == 'true'
+    except (ValueError, TypeError) as e:
+        print(f"Error converting parameters in batch_process: {e}")
+        # Continue with original values if conversion fails
+    
     ckpt_select = get_ckpt_path(ckpt_select)
     tiled = "TiledRestore" if args.use_tile_vae else "Restore"
     sampler_cls = f"sgm.modules.diffusionmodules.sampling.{tiled}{sampler}Sampler"
     if not ckpt_select:
         msg = "No checkpoint selected. Please select a checkpoint to continue."
-        return msg
+        return msg, msg
     start_time = time.time()
     last_result = "Select something to do."
     if not apply_llava and not apply_supir:
@@ -1292,6 +1445,9 @@ def batch_process(img_data,
     is_processing = True
     # Get the list of image files in the folder
     total_images = len(img_data)
+
+    # Convert num_images to integer to prevent type errors
+    num_images = int(num_images) if isinstance(num_images, str) else num_images
 
     # Total images, times number of images, plus 2 for load/unload
     total_supir_steps = total_images * num_images + 2 if apply_supir else 0
@@ -1327,6 +1483,13 @@ def batch_process(img_data,
     if apply_supir:
         progress(counter / total_steps, desc="Processing images...")
         printt("Processing images (Stage 2)")
+        # Ensure upscale is a float before passing it to supir_process
+        upscale = float(upscale)
+        # Ensure max_megapixels and max_resolution are floats
+        max_megapixels = float(max_megapixels) if max_megapixels is not None else 0
+        max_resolution = float(max_resolution) if max_resolution is not None else 0
+        # Ensure face_resolution is an integer
+        face_resolution = int(float(face_resolution)) if face_resolution is not None else 0
         last_result = supir_process(img_data, a_prompt, n_prompt, num_samples, upscale, edm_steps, s_stage1, s_stage2,
                                     s_cfg, seed, sampler_cls, s_churn, s_noise, color_fix_type, diff_dtype, ae_dtype,
                                     linear_CFG, linear_s_stage2, spt_linear_CFG, spt_linear_s_stage2, model_select,
@@ -1392,6 +1555,12 @@ def save_image(image_data: MediaData, is_video_frame: bool):
         if len(image_data.metadata_list) > i:
             event_dict = image_data.metadata_list[i]
 
+        # Ensure max_megapixels and max_resolution are in the metadata
+        if 'max_megapixels' not in event_dict and 'max_megapixels' in params:
+            event_dict['max_megapixels'] = params['max_megapixels']
+        if 'max_resolution' not in event_dict and 'max_resolution' in params:
+            event_dict['max_resolution'] = params['max_resolution']
+
         evt_id = event_dict.get('evt_id', str(time.time_ns()))
 
         base_filename = os.path.splitext(os.path.basename(image_path))[0]
@@ -1430,7 +1599,8 @@ def save_image(image_data: MediaData, is_video_frame: bool):
                     pass
             caption = image_data.caption.strip()
             if caption:
-                meta.add_text('caption', caption)
+                # Use the renamed key for caption instead of raw "caption"
+                meta.add_text(rename_meta_key("caption"), caption)
                 # This will save the caption to a file with the same name as the image
                 if save_caption:
                     caption_path = f'{os.path.splitext(save_path)[0]}.txt'
@@ -1628,7 +1798,7 @@ selected_pos, selected_neg, llava_style_prompt = select_style(
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
 
 with (block):
-    gr.Markdown("SUPIR V63 - https://www.patreon.com/posts/99176057")
+    gr.Markdown("SUPIR V64 - https://www.patreon.com/posts/99176057")
         
     with gr.Tab("Upscale"):
         # Execution buttons
@@ -1701,8 +1871,7 @@ with (block):
                     with gr.Row():
                         apply_llava_checkbox = gr.Checkbox(label="Apply LLaVa", value=False)
                         apply_supir_checkbox = gr.Checkbox(label="Apply SUPIR", value=True)
-                        ckpt_type = gr.Dropdown(label="Checkpoint Type", choices=["Standard SDXL", "SDXL Lightning"],
-                                                value="Standard SDXL")
+
                     with gr.Row():
                         with gr.Column():
                             prompt_style_dropdown = gr.Dropdown(label="Prompt Style",
@@ -1856,33 +2025,50 @@ with (block):
                         if not os.path.exists(file_path):
                             print("Don't forget to select a valid preset file")
                             return "Error"
-                        with open(file_path, 'r') as f:
-                            # Load the JSON string from the file
-                            json_string = json.load(f)
-                            # Decode the JSON string into a dictionary
-                            config = json.loads(json_string)
+                        try:
+                            with open(file_path, 'r') as f:
+                                # Load the JSON string from the file
+                                json_string = json.load(f)
+                                # Decode the JSON string into a dictionary
+                                config = json.loads(json_string)
+                        except Exception as e:
+                            print(f"Error loading preset: {str(e)}")
+                            return f"Error loading preset: {str(e)}"
 
-                        updates = [f"Loaded config from {file_path}"]
+                        # Create default updates (no change) for all elements
+                        all_updates = []
+                        for _ in elements_dict:
+                            all_updates.append(gr.update())
+                        for _ in extra_info_elements:
+                            all_updates.append(gr.update())
+                        
+                        # First update is the output message
+                        all_updates[0] = gr.update(value=f"Loaded preset: {preset_name}")
+                        
+                        # Apply config values to elements in elements_dict
                         for key, value in config.items():
-                            # Check if the key is in the dictionary of UI elements
-                            if key in elements_dict:
-                                if key == "src_file":
-                                    # Skip updating the "src_file" element
-                                    updates.append(gr.update())
-                                else:
-                                    # Update the value of the element if it exists and is not "src_file"
+                            try:
+                                if key in elements_dict:
+                                    if key == "src_file":
+                                        # Skip updating the source file
+                                        continue
+                                        
+                                    # Update the value in the elements_dict
                                     elements_dict[key].value = value
-                                    updates.append(gr.update(value=elements_dict[key].value))
+                                    # Get the index of the element
+                                    index = list(elements_dict.keys()).index(key)
+                                    # Update the corresponding update object
+                                    all_updates[index+1] = gr.update(value=value)
+                                elif key in extra_info_elements:
+                                    # Update extra info elements
+                                    extra_info_elements[key].value = value
+                                    # Calculate index (after elements_dict entries)
+                                    index = len(elements_dict) + list(extra_info_elements.keys()).index(key)
+                                    all_updates[index+1] = gr.update(value=value)
+                            except Exception as e:
+                                print(f"Error updating element {key}: {str(e)}")
 
-                            elif key in extra_info_elements:
-                                # Update the value of the element in extra_info_elements if it exists
-                                extra_info_elements[key].value = value
-                                updates.append(gr.update(value=value))
-                            else:
-                                # Append an update with no changes if the key is not recognized
-                                updates.append(gr.update())
-
-                        return updates
+                        return all_updates
 
 
                     def get_preset_list():
@@ -2140,7 +2326,7 @@ with (block):
     load_preset_button.click(fn=load_preset, inputs=[load_preset_dropdown],outputs=[output_label] + elements+elements_extra,
                 show_progress=True, queue=True)
 
-    apply_metadata_button.click(fn=apply_metadata, inputs=[meta_image], outputs=[output_label] + elements+elements_extra,
+    apply_metadata_button.click(fn=apply_metadata, inputs=[meta_image], outputs=[output_label] + elements + elements_extra,
                 show_progress=True, queue=True)
 
     def do_nothing():
