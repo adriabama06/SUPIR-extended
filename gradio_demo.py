@@ -1798,7 +1798,7 @@ selected_pos, selected_neg, llava_style_prompt = select_style(
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
 
 with (block):
-    gr.Markdown("SUPIR V66 - https://www.patreon.com/posts/99176057")
+    gr.Markdown("SUPIR V67 - https://www.patreon.com/posts/99176057")
         
     with gr.Tab("Upscale"):
         # Execution buttons
@@ -2011,12 +2011,20 @@ with (block):
                     presets_dir = os.path.join(os.path.dirname(__file__), 'presets')
                     if not os.path.exists(presets_dir):
                         os.makedirs(presets_dir)
+                    
+                    # Last used preset file path
+                    last_used_preset_file = os.path.join(presets_dir, 'last_used_preset.json')
 
                     def save_preset(preset_name, config):
                     #Save the current configuration to a file.
                         file_path = os.path.join(presets_dir, f"{preset_name}.json")
                         with open(file_path, 'w') as f:
                             json.dump(config, f)
+                        
+                        # Save as last used preset
+                        with open(last_used_preset_file, 'w') as f:
+                            json.dump(preset_name, f)
+                            
                         return "Preset saved successfully!"
 
                     def load_preset(preset_name):
@@ -2024,7 +2032,7 @@ with (block):
                         file_path = os.path.join(presets_dir, f"{preset_name}.json")
                         if not os.path.exists(file_path):
                             print("Don't forget to select a valid preset file")
-                            return "Error"
+                            return ["Error"] + [gr.update() for _ in range(len(elements_dict) + len(extra_info_elements))]
                         try:
                             with open(file_path, 'r') as f:
                                 # Load the JSON string from the file
@@ -2033,7 +2041,7 @@ with (block):
                                 config = json.loads(json_string)
                         except Exception as e:
                             print(f"Error loading preset: {str(e)}")
-                            return f"Error loading preset: {str(e)}"
+                            return [f"Error loading preset: {str(e)}"] + [gr.update() for _ in range(len(elements_dict) + len(extra_info_elements))]
 
                         # Create default updates (no change) for all elements
                         all_updates = []
@@ -2067,9 +2075,21 @@ with (block):
                                     all_updates[index+1] = gr.update(value=value)
                             except Exception as e:
                                 print(f"Error updating element {key}: {str(e)}")
+                        
+                        # Save as last used preset
+                        with open(last_used_preset_file, 'w') as f:
+                            json.dump(preset_name, f)
 
+                        # Make sure we're returning exactly the expected number of outputs
+                        expected_outputs = 1 + len(elements_dict) + len(extra_info_elements)
+                        if len(all_updates) < expected_outputs:
+                            # Add any missing updates if needed
+                            all_updates.extend([gr.update() for _ in range(expected_outputs - len(all_updates))])
+                        elif len(all_updates) > expected_outputs:
+                            # Trim if we somehow have too many
+                            all_updates = all_updates[:expected_outputs]
+                            
                         return all_updates
-
 
                     def get_preset_list():
                         """List all saved presets."""
@@ -2111,12 +2131,39 @@ with (block):
                             settings = serialize_settings(elements)
                             with open(preset_path, 'w') as f:
                                 json.dump(settings, f)
-                            return "Preset saved successfully!"
-                        return "Please provide a valid preset name."
+                                
+                            # Save as last used preset
+                            with open(last_used_preset_file, 'w') as f:
+                                json.dump(preset_name, f)
+                                
+                            # Return message and updated dropdown
+                            presets = list_presets()
+                            return f"Preset {preset_name} saved successfully!", gr.update(choices=presets, value=preset_name)
+                        return "Please provide a valid preset name.", gr.update()
 
                     def list_presets():
-                        presets = [file.split('.')[0] for file in os.listdir(presets_dir) if file.endswith('.json')]
+                        presets = [file.split('.')[0] for file in os.listdir(presets_dir) if file.endswith('.json') and file != 'last_used_preset.json']
                         return presets
+
+                    # Function to auto-load the last used preset
+                    def auto_load_last_preset():
+                        try:
+                            if os.path.exists(last_used_preset_file):
+                                with open(last_used_preset_file, 'r') as f:
+                                    last_preset = json.load(f)
+                                if last_preset and os.path.exists(os.path.join(presets_dir, f"{last_preset}.json")):
+                                    print(f"Auto-loading last used preset: {last_preset}")
+                                    # First update the dropdown
+                                    dropdown_update = gr.update(value=last_preset)
+                                    
+                                    # Then load the preset content
+                                    preset_updates = load_preset(last_preset)
+                                    
+                                    # Return only what this function needs to return
+                                    return dropdown_update, preset_updates[0]
+                        except Exception as e:
+                            print(f"Error auto-loading last used preset: {str(e)}")
+                        return gr.update(), ""
 
                     with gr.Row():
                         preset_name_textbox = gr.Textbox(label="Preset Name")
@@ -2321,10 +2368,19 @@ with (block):
     video_end_time_number.change(fn=update_end_time, inputs=[src_input_file, upscale_slider, max_mp_slider, max_res_slider, video_end_time_number],
                                  outputs=target_res_textbox)
 
-    save_preset_button.click(fn=save_current_preset, inputs=[preset_name_textbox]+elements+elements_extra, outputs=[output_label])
+    save_preset_button.click(fn=save_current_preset, inputs=[preset_name_textbox]+elements+elements_extra, outputs=[output_label, load_preset_dropdown])
     refresh_presets_button.click(fn=lambda: gr.update(choices=list_presets()), inputs=[], outputs=[load_preset_dropdown])
-    load_preset_button.click(fn=load_preset, inputs=[load_preset_dropdown],outputs=[output_label] + elements+elements_extra,
+    
+    # Add an event handler for auto-loading the last preset when dropdown value changes
+    load_preset_dropdown.change(fn=load_preset, inputs=[load_preset_dropdown], outputs=[output_label] + elements+elements_extra,
                 show_progress=True, queue=True)
+    
+    # Regular load button click
+    load_preset_button.click(fn=load_preset, inputs=[load_preset_dropdown], outputs=[output_label] + elements+elements_extra,
+                show_progress=True, queue=True)
+    
+    # Auto-load the last used preset on interface load
+    block.load(fn=auto_load_last_preset, outputs=[load_preset_dropdown, output_label])
 
     apply_metadata_button.click(fn=apply_metadata, inputs=[meta_image], outputs=[output_label] + elements + elements_extra,
                 show_progress=True, queue=True)
@@ -2336,6 +2392,8 @@ with (block):
     slider_dl_button.click(js="downloadImage", show_progress=False, queue=True, fn=do_nothing)
 
 if args.port is not None:  # Check if the --port argument is provided
+    # Remove direct loading here as it won't work
     block.launch(server_name=server_ip, server_port=args.port, share=args.share, inbrowser=args.open_browser)
 else:
+    # Remove direct loading here as it won't work
     block.launch(server_name=server_ip, share=args.share, inbrowser=args.open_browser)
