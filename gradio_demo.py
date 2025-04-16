@@ -1798,7 +1798,7 @@ selected_pos, selected_neg, llava_style_prompt = select_style(
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
 
 with (block):
-    gr.Markdown("SUPIR V65 - https://www.patreon.com/posts/99176057")
+    gr.Markdown("SUPIR V66 - https://www.patreon.com/posts/99176057")
         
     with gr.Tab("Upscale"):
         # Execution buttons
