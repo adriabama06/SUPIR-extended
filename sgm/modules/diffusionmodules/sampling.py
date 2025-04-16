@@ -31,6 +31,9 @@ class BaseDiffusionSampler:
             guider_config: Union[Dict, ListConfig, OmegaConf, None] = None,
             verbose: bool = False,
             device: str = "cuda",
+            restore_cfg: float = None,
+            restore_cfg_s_tmin: float = None,
+            **kwargs
     ):
         self.num_steps = num_steps
         self.discretization = instantiate_from_config(discretization_config)
