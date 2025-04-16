@@ -20,6 +20,8 @@ import torch
 from PIL import Image
 from PIL import PngImagePlugin
 from gradio_imageslider import ImageSlider
+import pillow_avif  # Import the AVIF plugin
+from PIL import UnidentifiedImageError
 
 import ui_helpers
 from SUPIR.models.SUPIR_model import SUPIRModel
@@ -111,6 +113,64 @@ if torch.cuda.is_available() and args.autotune:
 shared.opts.half_mode = args.loading_half_params  
 shared.opts.fast_load_sd = args.fast_load_sd
 
+# Add this function after imports and before any other functions
+def safe_open_image(image_path):
+    """Safely open any image format including AVIF with fallback options."""
+    try:
+        # Try to open normally first
+        return Image.open(image_path)
+    except UnidentifiedImageError as e:
+        print(f"Error opening image with PIL: {str(e)}. Attempting to convert...")
+        try:
+            # Create a temporary file for the converted image
+            import tempfile
+            temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.png').name
+            
+            # Try several methods to convert the image
+            converted = False
+            
+            # 1. Try using pillow_avif directly
+            try:
+                with Image.open(image_path) as img:
+                    img.save(temp_output, format='PNG')
+                converted = True
+            except Exception as conversion_error:
+                print(f"Direct conversion failed: {str(conversion_error)}")
+            
+            # 2. Try using Wand (ImageMagick binding)
+            if not converted:
+                try:
+                    from wand.image import Image as WandImage
+                    with WandImage(filename=image_path) as wand_img:
+                        wand_img.save(filename=temp_output)
+                    converted = True
+                    print(f"Converted image using Wand")
+                except Exception as wand_error:
+                    print(f"Wand conversion failed: {str(wand_error)}")
+            
+            # 3. Try using system commands
+            if not converted:
+                import subprocess
+                try:
+                    if os.name == 'nt':  # Windows
+                        subprocess.run(['magick', 'convert', image_path, temp_output], check=True)
+                    else:  # Linux/Mac
+                        subprocess.run(['convert', image_path, temp_output], check=True)
+                    converted = True
+                    print(f"Converted image using system commands")
+                except Exception as cmd_error:
+                    print(f"System command conversion failed: {str(cmd_error)}")
+            
+            if converted:
+                return Image.open(temp_output)
+            else:
+                raise Exception("All conversion methods failed")
+        except Exception as e:
+            print(f"Failed to convert image: {str(e)}")
+            raise
+    except Exception as e:
+        print(f"Error opening image: {str(e)}")
+        raise
 
 def apply_metadata(image_path):
     global elements_dict, extra_info_elements
@@ -120,7 +180,7 @@ def apply_metadata(image_path):
 
     # Open the image and extract metadata
     try:
-        with Image.open(image_path) as img:
+        with safe_open_image(image_path) as img:
             metadata = img.info
            
             # First update is for output_label
@@ -197,13 +257,12 @@ def apply_metadata(image_path):
                         all_updates[index] = gr.update(value=value)
                         updated_elements.add(renamed_key)
                 except Exception as e:
-                    print(f"Error processing metadata key {key}: {str(e)}")
-                    continue
-                    
+                    print(f"Error processing metadata key '{key}': {str(e)}")
+            
             return all_updates
     except Exception as e:
-        print(f"Error opening image or applying metadata: {str(e)}")
-        return [gr.update(value=f"Error: {str(e)}")] + [gr.update() for _ in range(len(elements_dict) + len(extra_info_elements))]
+        print(f"Error applying metadata: {str(e)}")
+        return [gr.update(value=f"Error applying metadata: {str(e)}")] + [gr.update() for _ in range(len(elements_dict) + len(extra_info_elements))]
 
 if args.fp8:
     shared.opts.half_mode = args.fp8
@@ -621,10 +680,15 @@ def update_target_resolution(img, do_upscale, max_megapixels=0, max_resolution=0
         if is_image(img):
             last_input_path = img
             last_video_params = None
-            with Image.open(img) as img_obj:
-                width, height = img_obj.size
-                width_org, height_org = img_obj.size
-                #print(f"Image dimensions: {width}x{height}")
+            try:
+                # Use the safe_open_image helper instead of direct Image.open
+                with safe_open_image(img) as img_obj:
+                    width, height = img_obj.size
+                    width_org, height_org = img_obj.size
+            except Exception as e:
+                print(f"Failed to open image: {str(e)}")
+                raise
+                    
         elif is_video(img):
             if img == last_input_path:
                 params = last_video_params
@@ -768,29 +832,32 @@ def read_image_metadata(image_path):
     last_modified_timestamp = os.path.getmtime(image_path)
     last_modified_date = datetime.fromtimestamp(last_modified_timestamp).strftime('%d %B %Y, %H:%M %p - UTC')
 
-    # Open the image and extract metadata
-    with Image.open(image_path) as img:
-        width, height = img.size
-        megapixels = (width * height) / 1e6
+    try:
+        # Open the image and extract metadata using the safe helper
+        with safe_open_image(image_path) as img:
+            width, height = img.size
+            megapixels = (width * height) / 1e6
 
-        metadata_str = f"Last Modified Date: {last_modified_date}\nMegapixels: {megapixels:.2f}\n"
+            metadata_str = f"Last Modified Date: {last_modified_date}\nMegapixels: {megapixels:.2f}\n"
 
-        # Extract metadata based on image format
-        if img.format == 'JPEG':
-            exif_data = img._getexif()
-            if exif_data:
-                for tag, value in exif_data.items():
-                    tag_name = Image.ExifTags.TAGS.get(tag, tag)
-                    metadata_str += f"{tag_name}: {value}\n"
-        else:
-            metadata = img.info
-            if metadata:
-                for key, value in metadata.items():
-                    metadata_str += f"{key}: {value}\n"
+            # Extract metadata based on image format
+            if img.format == 'JPEG':
+                exif_data = img._getexif()
+                if exif_data:
+                    for tag, value in exif_data.items():
+                        tag_name = Image.ExifTags.TAGS.get(tag, tag)
+                        metadata_str += f"{tag_name}: {value}\n"
             else:
-                metadata_str += "No additional metadata found."
+                metadata = img.info
+                if metadata:
+                    for key, value in metadata.items():
+                        metadata_str += f"{key}: {value}\n"
+                else:
+                    metadata_str += "No additional metadata found."
 
-    return metadata_str
+        return metadata_str
+    except Exception as e:
+        return f"Error reading metadata: {str(e)}"
 
 
 def update_elements(status_label):
@@ -858,7 +925,7 @@ def populate_slider_single():
         "http://www.marketingtool.online/en/face-generator/img/faces/avatar-1151ce9f4b2043de0d2e3b7826127998.jpg").content)
     temp_path.close()
     lowres_path = temp_path.name.replace('.jpg', '_lowres.jpg')
-    with Image.open(temp_path.name) as img:
+    with safe_open_image(temp_path.name) as img:
         current_dims = (img.size[0] // 2, img.size[1] // 2)
         resized_dims = (img.size[0] // 4, img.size[1] // 4)
         img = img.resize(current_dims)
@@ -876,7 +943,7 @@ def populate_gallery():
         "http://www.marketingtool.online/en/face-generator/img/faces/avatar-1151ce9f4b2043de0d2e3b7826127998.jpg").content)
     temp_path.close()
     lowres_path = temp_path.name.replace('.jpg', '_lowres.jpg')
-    with Image.open(temp_path.name) as img:
+    with safe_open_image(temp_path.name) as img:
         current_dims = (img.size[0] // 2, img.size[1] // 2)
         resized_dims = (img.size[0] // 4, img.size[1] // 4)
         img = img.resize(current_dims)
@@ -931,7 +998,7 @@ def start_single_process(*element_values):
         for file in image_files:
             try:
                 media_data = MediaData(media_path=file)
-                img = Image.open(file)
+                img = safe_open_image(file)
                 media_data.media_data = np.array(img)
                 media_data.caption = values_dict['main_prompt']
                 img_data.append(media_data)
@@ -983,7 +1050,7 @@ def start_batch_process(*element_values):
     img_data = []
     for file in image_files:
         media_data = MediaData(media_path=os.path.join(batch_folder, file))
-        img = Image.open(os.path.join(batch_folder, file))
+        img = safe_open_image(os.path.join(batch_folder, file))
         media_data.media_data = np.array(img)
         media_data.caption = values_dict['main_prompt']
         img_data.append(media_data)
@@ -1039,7 +1106,7 @@ def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions
             
         progress(step / total_steps, desc=f"Processing image {step}/{len(inputs)} with LLaVA...")
         if img is None:  ## this is for llava and video
-            img = Image.open(img_path)
+            img = safe_open_image(img_path)
             img = np.array(img)
         lq = HWC3(img)
         lq = Image.fromarray(lq.astype('uint8'))
@@ -1144,7 +1211,7 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
         progress(counter / total_progress, desc=f"Processing image {counter}/{total_images}...")
         if img is None:
             printt(f"Image {counter}/{total_images} is None, loading from disk.")
-            with Image.open(image_path) as img:
+            with safe_open_image(image_path) as img:
                 img = np.array(img)
 
         printt(f"Processing image {counter}/{total_images}...")
@@ -1213,11 +1280,23 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
             load_face_helper()
             if face_helper is None or not isinstance(face_helper, FaceRestoreHelper):
                 raise ValueError('Face helper not loaded')
+            # <<< FIX: Update face_helper's upscale factor >>>
+            printt(f"DEBUG: Setting face_helper upscale_factor to {final_upscale}")
+            face_helper.upscale_factor = final_upscale 
+            # <<< END FIX >>>
             face_helper.clean_all()
             face_helper.read_image(lq)
             # get face landmarks for each face
+            printt(f"DEBUG: Getting face landmarks for image shape {lq.shape}...")
             face_helper.get_face_landmarks_5(only_center_face=False, resize=640, eye_dist_threshold=5)
+            printt(f"DEBUG: Found {len(face_helper.all_landmarks_5)} faces. Aligning and warping...")
             face_helper.align_warp_face()
+            printt(f"DEBUG: Alignment complete. Number of cropped faces: {len(face_helper.cropped_faces)}")
+            if len(face_helper.cropped_faces) > 0:
+                printt(f"DEBUG: First cropped face dimensions: {face_helper.cropped_faces[0].shape}")
+            else:
+                printt("DEBUG: No faces found or cropped.")
+
 
             lq = lq / 255 * 2 - 1
             lq = torch.tensor(lq, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(SUPIR_device)[:, :3,
@@ -1278,50 +1357,76 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                     face = torch.tensor(face, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(SUPIR_device)[:, :3,
                            :, :]
                     faces.append(face)
+                
+                printt(f"DEBUG: Prepared {len(faces)} faces for upscaling.")
 
                 for index, face in enumerate(faces):
                     progress(index / len(faces), desc=f"Upscaling Face {index}/{len(faces)}")
                     caption = face_captions[0]  # currently we dont have multiple captions for faces
                     gen_params['face_prompt'] = caption
+                    printt(f"DEBUG: Upscaling face {index+1}/{len(faces)} with resolution {face_resolution}...")
                     samples = process_sample(model, face, [caption], face_resolution, is_face=True)
                     if samples is None:
-                        printt("Face processing was cancelled")
+                        printt(f"DEBUG: Face processing was cancelled for face {index+1}")
                         continue
+                    
+                    printt(f"DEBUG: Upscaled face {index+1} dimensions before interpolation: {samples.shape}")
+                    # Interpolate samples
                     samples = torch.nn.functional.interpolate(samples, size=face_helper.face_size, mode='bilinear',
                                                               align_corners=False)
+                    printt(f"DEBUG: Upscaled face {index+1} dimensions after interpolation: {samples.shape}")
+                    
                     x_samples = (einops.rearrange(samples,
                                                   'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().round().clip(0,
                                                                                                                     255).astype(
                         np.uint8)
+                    
+                    printt(f"DEBUG: Adding restored face {index+1} with dimensions {x_samples[0].shape} to helper.")
                     face_helper.add_restored_face(x_samples[0])
                     restored_faces.append(x_samples[0])
                 gen_params["face_gallery"] = restored_faces
+                printt(f"DEBUG: Finished upscaling {len(face_helper.restored_faces)} faces.")
 
             # Look ma, we can do either now!
             if apply_bg:
+                printt("DEBUG: Applying background restoration.")
                 caption = [img_prompt]
                 samples = process_sample(model, lq, caption)
                 if samples is None:
-                    printt("Background processing was cancelled")
+                    printt("DEBUG: Background processing was cancelled")
                     break
                 _bg = (einops.rearrange(samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().round().clip(0,
                                                                                                                    255).astype(
                     np.uint8)
+                printt(f"DEBUG: Background restored. Dimensions: {_bg[0].shape}")
                 if apply_face:
+                    printt(f"DEBUG: Getting inverse affine transform before pasting faces onto BG. Restored faces count: {len(face_helper.restored_faces)}")
                     face_helper.get_inverse_affine(None)
+                    printt(f"DEBUG: Pasting {len(face_helper.restored_faces)} faces onto upscaled background image with shape {_bg[0].shape}")
                     result = face_helper.paste_faces_to_input_image(upsample_img=_bg[0])
+                    printt(f"DEBUG: Pasting complete. Final image shape: {result.shape if result is not None else 'None'}")
                 else:
                     result = _bg[0]
+                    printt("DEBUG: Using only restored background. Final image shape: {result.shape if result is not None else 'None'}")
 
             if not apply_bg and apply_face:                
+                printt(f"DEBUG: Applying only face restoration. Restored faces count: {len(face_helper.restored_faces)}")
+                printt("DEBUG: Getting inverse affine transform before pasting faces onto original sized image.")
+                # <<< FIX: Update face_helper's upscale factor (redundant here if done earlier, but safe) >>>
+                printt(f"DEBUG: Ensuring face_helper upscale_factor is {final_upscale}")
+                face_helper.upscale_factor = final_upscale 
+                # <<< END FIX >>>
                 face_helper.get_inverse_affine(None)
-
                 # the image the face helper is using is already scaled to the desired resolution using lanzcos
                 # I believe the output from this function should be just the original image but with only the face
                 # restoration. 
+                # Let's log the image the helper is using
+                printt(f"DEBUG: Pasting {len(face_helper.restored_faces)} faces onto helper's internal image. Shape: {face_helper.input_img.shape if hasattr(face_helper, 'input_img') else 'N/A'}")
                 result = face_helper.paste_faces_to_input_image()
+                printt(f"DEBUG: Pasting complete (no BG). Final image shape: {result.shape if result is not None else 'None'}")
 
             if not apply_face and not apply_bg:
+                printt("DEBUG: Applying standard SUPIR upscale (no face/BG restoration).")
                 caption = [img_prompt]
                 print("Batchifying sample...")
                 samples = process_sample(model, lq, caption)
@@ -1798,7 +1903,7 @@ selected_pos, selected_neg, llava_style_prompt = select_style(
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
 
 with (block):
-    gr.Markdown("SUPIR V67 - https://www.patreon.com/posts/99176057")
+    gr.Markdown("SUPIR V68 - https://www.patreon.com/posts/99176057")
         
     with gr.Tab("Upscale"):
         # Execution buttons
@@ -2045,13 +2150,15 @@ with (block):
 
                         # Create default updates (no change) for all elements
                         all_updates = []
+                        all_updates.append(gr.update(value=f"Loaded preset: {preset_name}"))  # First update is the output message
+                        
+                        # Add updates for elements_dict
                         for _ in elements_dict:
                             all_updates.append(gr.update())
+                        
+                        # Add updates for extra_info_elements
                         for _ in extra_info_elements:
                             all_updates.append(gr.update())
-                        
-                        # First update is the output message
-                        all_updates[0] = gr.update(value=f"Loaded preset: {preset_name}")
                         
                         # Apply config values to elements in elements_dict
                         for key, value in config.items():
@@ -2069,10 +2176,11 @@ with (block):
                                     all_updates[index+1] = gr.update(value=value)
                                 elif key in extra_info_elements:
                                     # Update extra info elements
-                                    extra_info_elements[key].value = value
-                                    # Calculate index (after elements_dict entries)
-                                    index = len(elements_dict) + list(extra_info_elements.keys()).index(key)
-                                    all_updates[index+1] = gr.update(value=value)
+                                    if value is not None:
+                                        extra_info_elements[key].value = value
+                                        # Calculate index (after elements_dict entries)
+                                        index = len(elements_dict) + list(extra_info_elements.keys()).index(key)
+                                        all_updates[index+1] = gr.update(value=value)
                             except Exception as e:
                                 print(f"Error updating element {key}: {str(e)}")
                         
