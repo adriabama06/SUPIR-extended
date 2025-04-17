@@ -117,6 +117,7 @@
     top: 0;
     z-index: 50;
     overflow: hidden;
+    background-color: rgba(0,0,0,0.9);
 }
 
 .slider_button.full {
@@ -139,13 +140,13 @@
 
 #fullscreen_button {
     top: 10px; /* Adjust as needed for spacing from the top */
-    right: 10px; /* Distance of the first button from the right, including space for the second button and some padding */
+    right: 40px; /* Distance of the first button from the right, including space for the second button and some padding */
     transform: none; /* Removed to position at the top correctly */
 }
 
 #download_button {
     top: 10px; /* Adjust as needed for spacing from the top */
-    right: 40px; /* Adjust as needed for spacing from the right edge */
+    right: 80px; /* Adjust as needed for spacing from the right edge */
     transform: none; /* Removed to position at the top correctly */
 }
 
@@ -257,6 +258,132 @@
 
 .info-div.open {
     display: flex;
+}
+
+.compare_slider_container {
+    position: relative;
+    width: 100%;
+}
+
+.compare_slider_container.full_preview {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 1000;
+    background-color: rgba(0,0,0,0.9);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 20px;
+    overflow: hidden;
+}
+
+.compare_slider_container.full_preview #compare_slider {
+    width: 90vw !important;
+    height: 90vh !important;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.compare_slider_container.full_preview img {
+    max-height: 90vh !important;
+    max-width: 90vw !important;
+    width: auto !important;
+    height: auto !important;
+    object-fit: contain !important;
+}
+
+#compare_download_button, #compare_fullscreen_button {
+    position: absolute;
+    width: 35px;
+    height: 35px;
+    border-radius: 50%;
+    background-color: rgba(255, 255, 255, 0.8);
+    color: #000;
+    font-size: 20px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    cursor: pointer;
+    z-index: 1100;
+}
+
+#compare_download_button {
+    top: 10px;
+    right: 60px;
+}
+
+#compare_fullscreen_button {
+    top: 10px;
+    right: 10px;
+}
+
+#compare_download_button.full, #compare_fullscreen_button.full {
+    position: fixed;
+    background-color: rgba(255, 255, 255, 0.8);
+}
+
+/* Make sure the slider takes full height and width in fullscreen mode */
+.compare_slider_container.full_preview .gradio-image_slider {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+/* Make all noUiSlider instances properly positioned */
+.noUi-target {
+    position: relative;
+}
+
+/* Apply fullscreen mode to comparison preview */
+#compare_preview_column.full_preview {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw !important;
+    height: 100vh !important;
+    z-index: 1000;
+    background-color: rgba(0,0,0,0.9);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 0;
+    margin: 0;
+    overflow: hidden;
+}
+
+#compare_preview_column.full_preview #compare_slider {
+    width: 100vw !important;
+    height: 100vh !important;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin: 0;
+    padding: 0;
+}
+
+#compare_preview_column.full_preview img {
+    max-height: 95vh !important;
+    max-width: 95vw !important;
+    width: auto !important;
+    height: auto !important;
+    object-fit: contain !important;
+}
+
+/* Make sure the slider takes full height and width in fullscreen mode */
+#compare_preview_column.full_preview .gradio-image_slider {
+    width: 100% !important;
+    height: 100% !important;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin: 0;
+    padding: 0;
 }
 
 

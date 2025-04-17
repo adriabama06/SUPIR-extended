@@ -176,6 +176,78 @@ function toggleFullscreen() {
         });
         openLabels = [];
         isActive = false;
+        
+        // Get the slider element for fixing layout after exiting fullscreen
+        const previewSlider = document.getElementById('gallery1');
+        if (previewSlider) {
+            // Apply layout fix after exiting fullscreen
+            setTimeout(() => {
+                // Force layout recalculation
+                window.dispatchEvent(new Event('resize'));
+                
+                // Create a temporary element to force layout recalculation
+                const tempDiv = document.createElement('div');
+                tempDiv.style.position = 'fixed';
+                tempDiv.style.top = '0';
+                tempDiv.style.right = '0';
+                tempDiv.style.width = '1px';
+                tempDiv.style.height = '1px';
+                tempDiv.style.zIndex = '9999';
+                document.body.appendChild(tempDiv);
+                
+                // Force a layout recalculation
+                void tempDiv.offsetHeight;
+                
+                // Remove after a short delay
+                setTimeout(() => {
+                    document.body.removeChild(tempDiv);
+                    
+                    // Additional forceful layout recalculations
+                    window.dispatchEvent(new Event('resize'));
+                    
+                    // Force slider to refresh its own layout
+                    if (previewSlider) {
+                        // Reset any image-specific styles
+                        const images = previewSlider.querySelectorAll('img');
+                        images.forEach(img => {
+                            img.style.imageRendering = '';
+                            img.style.width = '';
+                            img.style.height = '';
+                        });
+                        
+                        // Force a reflow by changing slider height temporarily
+                        const currentHeight = previewSlider.style.height;
+                        previewSlider.style.height = "0";
+                        void previewSlider.offsetHeight; // Force reflow
+                        previewSlider.style.height = currentHeight || "400px";
+                        
+                        // Adjust the slider container
+                        const sliderContainer = previewSlider.querySelector('.slider-wrap');
+                        if (sliderContainer) {
+                            sliderContainer.style.height = "100%";
+                            sliderContainer.style.display = "flex";
+                            sliderContainer.style.justifyContent = "center";
+                            sliderContainer.style.alignItems = "center";
+                        }
+                        
+                        // Fix slider alignment
+                        const sliderHolders = previewSlider.querySelectorAll('.noUi-base, .noUi-connects');
+                        sliderHolders.forEach(el => {
+                            el.style.position = 'absolute';
+                            el.style.top = '50%';
+                            el.style.transform = 'translateY(-50%)';
+                        });
+                        
+                        // Fix handle positions
+                        const handles = previewSlider.querySelectorAll('.noUi-handle');
+                        handles.forEach(handle => {
+                            handle.style.position = 'absolute';
+                            handle.style.transform = 'translateY(-50%)';
+                        });
+                    }
+                }, 100);
+            }, 50);
+        }
     } else {
         openLabels = document.querySelectorAll('.label-wrap.open');
         openLabels.forEach((label) => {
@@ -183,9 +255,88 @@ function toggleFullscreen() {
             // Get the sibling div and add display: none!important
             let sibling = label.nextElementSibling;
             sibling.style.display = 'none';
-
         });
         isActive = true;
+        
+        // Get the slider element
+        const previewSlider = document.getElementById('gallery1');
+        if (previewSlider) {
+            // Fix for alignment issue using safer layout recalculation methods
+            setTimeout(() => {
+                // Multiple forceful layout recalculations
+                window.dispatchEvent(new Event('resize'));
+                
+                // Create a temporary element to force layout recalculation
+                const tempDiv = document.createElement('div');
+                tempDiv.style.position = 'fixed';
+                tempDiv.style.top = '0';
+                tempDiv.style.right = '0';
+                tempDiv.style.width = '1px';
+                tempDiv.style.height = '1px';
+                tempDiv.style.zIndex = '9999';
+                document.body.appendChild(tempDiv);
+                
+                // Force a layout recalculation
+                void tempDiv.offsetHeight;
+                
+                // Remove after a short delay
+                setTimeout(() => {
+                    document.body.removeChild(tempDiv);
+                    
+                    // Another round of layout recalculations
+                    window.dispatchEvent(new Event('resize'));
+                    
+                    // Additional layout adjustments
+                    const sliderContainer = previewSlider.querySelector('.slider-wrap');
+                    if (sliderContainer) {
+                        sliderContainer.style.height = "100%";
+                        sliderContainer.style.display = "flex";
+                        sliderContainer.style.justifyContent = "center";
+                        sliderContainer.style.alignItems = "center";
+                    }
+                    
+                    // Ensure any images are properly sized
+                    const images = previewSlider.querySelectorAll('img');
+                    if (images.length === 2) {
+                        // Determine which is larger
+                        const img1 = images[0];
+                        const img2 = images[1];
+                        
+                        if (img1 && img2) {
+                            const img1Area = img1.naturalWidth * img1.naturalHeight;
+                            const img2Area = img2.naturalWidth * img2.naturalHeight;
+                            
+                            if (img1Area > img2Area) {
+                                // img1 is larger, resize img2 to match
+                                img2.style.imageRendering = 'pixelated'; // Use nearest-neighbor scaling
+                                img2.width = img1.naturalWidth;
+                                img2.height = img1.naturalHeight;
+                            } else if (img2Area > img1Area) {
+                                // img2 is larger, resize img1 to match
+                                img1.style.imageRendering = 'pixelated'; // Use nearest-neighbor scaling
+                                img1.width = img2.naturalWidth;
+                                img1.height = img2.naturalHeight;
+                            }
+                        }
+                    }
+                    
+                    // Apply additional styles to fix slider alignment
+                    const sliderHolders = previewSlider.querySelectorAll('.noUi-base, .noUi-connects');
+                    sliderHolders.forEach(el => {
+                        el.style.position = 'absolute';
+                        el.style.top = '50%';
+                        el.style.transform = 'translateY(-50%)';
+                    });
+                    
+                    // Fix the slider handle positions
+                    const handles = previewSlider.querySelectorAll('.noUi-handle');
+                    handles.forEach(handle => {
+                        handle.style.position = 'absolute';
+                        handle.style.transform = 'translateY(-50%)';
+                    });
+                }, 100);
+            }, 50);
+        }
     }
     let output = filterArgs(0, arguments);
     console.log('toggleFullscreen', isActive, output);

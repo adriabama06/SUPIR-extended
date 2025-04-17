@@ -40,6 +40,227 @@ from ui_helpers import is_video, extract_video, compile_video, is_image, get_vid
 
 SUPIR_REVISION = "v52"
 
+def get_recent_images(num_images=20):
+    """
+    Get a list of recent image files from the outputs folder without scanning subfolders.
+    """
+    try:
+        if not os.path.exists(args.outputs_folder):
+            os.makedirs(args.outputs_folder, exist_ok=True)
+            return []
+        
+        # Get all image files from only the main outputs folder, not subfolders
+        image_files = []
+        # Instead of os.walk, just list files in the main directory
+        for file in os.listdir(args.outputs_folder):
+            file_path = os.path.join(args.outputs_folder, file)
+            # Only process files (not directories) with image extensions
+            if os.path.isfile(file_path) and file.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.avif')):
+                # Get file modification time
+                mtime = os.path.getmtime(file_path)
+                image_files.append((file_path, mtime))
+        
+        # Sort by modification time, most recent first
+        image_files.sort(key=lambda x: x[1], reverse=True)
+        
+        # Extract just the paths for the most recent images
+        recent_paths = [item[0] for item in image_files[:num_images]]
+        
+        return recent_paths
+    except Exception as e:
+        print(f"Error getting recent images: {str(e)}")
+        return []
+
+def update_comparison_images(image1_path, image2_path):
+    """
+    Update the image comparison slider with the selected images.
+    Resize smaller image to match the larger image's dimensions using nearest neighbor interpolation.
+    """
+    if image1_path and image2_path:
+        try:
+            img1 = safe_open_image(image1_path)
+            img2 = safe_open_image(image2_path)
+            
+            # Get dimensions of both images
+            width1, height1 = img1.size
+            width2, height2 = img2.size
+            
+            # Determine which image is larger
+            if (width1 * height1) > (width2 * height2):
+                # img1 is larger, resize img2 to match img1's dimensions
+                img2 = img2.resize((width1, height1), Image.NEAREST)
+            elif (width2 * height2) > (width1 * height1):
+                # img2 is larger, resize img1 to match img2's dimensions
+                img1 = img1.resize((width2, height2), Image.NEAREST)
+            
+            return gr.update(visible=True, value=(img1, img2)), gr.update(value=f"Comparing: {os.path.basename(image1_path)} and {os.path.basename(image2_path)}")
+        except Exception as e:
+            return gr.update(visible=False), gr.update(value=f"Error loading images: {str(e)}")
+    else:
+        return gr.update(visible=False), gr.update(value="Please select two images to compare")
+
+def refresh_image_list():
+    """
+    Refresh the list of recent images for the comparison tab.
+    """
+    recent_images = get_recent_images(20)
+    return gr.update(value=recent_images)
+
+# Global variables to keep track of selected images
+selected_image1 = None
+selected_image2 = None
+
+def on_image_select_gallery1(evt: gr.SelectData, gallery_images):
+    """Handle image selection from the first gallery."""
+    global selected_image1
+    
+    if not gallery_images or evt.index >= len(gallery_images):
+        return gr.update(value="Invalid selection"), gr.update(), gr.update()
+    
+    # Gallery images from get_recent_images should be paths, not tuples
+    selected_image1 = gallery_images[evt.index]
+    # Check if it's a tuple and extract the path if needed
+    if isinstance(selected_image1, tuple):
+        selected_image1 = selected_image1[0] if selected_image1 else None
+    
+    if not selected_image1:
+        return gr.update(value="Invalid selection"), gr.update(), gr.update()
+        
+    message = f"Selected image 1: {os.path.basename(selected_image1)}"
+    
+    if selected_image2:
+        # Check if selected_image2 is a tuple and extract the path if needed
+        image2_path = selected_image2
+        if isinstance(selected_image2, tuple):
+            image2_path = selected_image2[0] if selected_image2 else None
+            
+        if not image2_path:
+            return gr.update(value=message), gr.update(), gr.update(value=selected_image1)
+            
+        message += f" and image 2: {os.path.basename(image2_path)}"
+        
+        try:
+            img1 = safe_open_image(selected_image1)
+            img2 = safe_open_image(image2_path)
+            
+            # Get dimensions of both images
+            width1, height1 = img1.size
+            width2, height2 = img2.size
+            
+            # Determine which image is larger
+            if (width1 * height1) > (width2 * height2):
+                # img1 is larger, resize img2 to match img1's dimensions
+                img2 = img2.resize((width1, height1), Image.NEAREST)
+            elif (width2 * height2) > (width1 * height1):
+                # img2 is larger, resize img1 to match img2's dimensions
+                img1 = img1.resize((width2, height2), Image.NEAREST)
+                
+            return gr.update(value=message), gr.update(visible=True, value=(img1, img2)), gr.update(value=selected_image1)
+        except Exception as e:
+            return gr.update(value=f"Error loading images: {str(e)}"), gr.update(visible=False), gr.update(value=selected_image1)
+    
+    return gr.update(value=message), gr.update(), gr.update(value=selected_image1)
+
+def on_image_select_gallery2(evt: gr.SelectData, gallery_images):
+    """Handle image selection from the second gallery."""
+    global selected_image2
+    
+    if not gallery_images or evt.index >= len(gallery_images):
+        return gr.update(value="Invalid selection"), gr.update(), gr.update()
+    
+    # Gallery images from get_recent_images should be paths, not tuples
+    selected_image2 = gallery_images[evt.index]
+    # Check if it's a tuple and extract the path if needed
+    if isinstance(selected_image2, tuple):
+        selected_image2 = selected_image2[0] if selected_image2 else None
+    
+    if not selected_image2:
+        return gr.update(value="Invalid selection"), gr.update(), gr.update()
+        
+    message = f"Selected image 2: {os.path.basename(selected_image2)}"
+    
+    if selected_image1:
+        # Check if selected_image1 is a tuple and extract the path if needed
+        image1_path = selected_image1
+        if isinstance(selected_image1, tuple):
+            image1_path = selected_image1[0] if selected_image1 else None
+            
+        if not image1_path:
+            return gr.update(value=message), gr.update(), gr.update(value=selected_image2)
+            
+        message = f"Selected image 1: {os.path.basename(image1_path)} and image 2: {os.path.basename(selected_image2)}"
+        
+        try:
+            img1 = safe_open_image(image1_path)
+            img2 = safe_open_image(selected_image2)
+            
+            # Get dimensions of both images
+            width1, height1 = img1.size
+            width2, height2 = img2.size
+            
+            # Determine which image is larger
+            if (width1 * height1) > (width2 * height2):
+                # img1 is larger, resize img2 to match img1's dimensions
+                img2 = img2.resize((width1, height1), Image.NEAREST)
+            elif (width2 * height2) > (width1 * height1):
+                # img2 is larger, resize img1 to match img2's dimensions
+                img1 = img1.resize((width2, height2), Image.NEAREST)
+                
+            return gr.update(value=message), gr.update(visible=True, value=(img1, img2)), gr.update(value=selected_image2)
+        except Exception as e:
+            return gr.update(value=f"Error loading images: {str(e)}"), gr.update(visible=False), gr.update(value=selected_image2)
+    
+    return gr.update(value=message), gr.update(), gr.update(value=selected_image2)
+
+def clear_selected_images():
+    """Clear selected images and refresh the galleries."""
+    global selected_image1, selected_image2
+    selected_image1 = None
+    selected_image2 = None
+    recent_images = get_recent_images(20)
+    return gr.update(value=recent_images), gr.update(value=recent_images), gr.update(value="Select one image from each gallery below"), gr.update(visible=False), gr.update(value=""), gr.update(value="")
+
+def compare_selected_images(image1_path, image2_path, uploaded_img1=None, uploaded_img2=None):
+    """
+    Compare images from either the galleries or uploads.
+    Resize smaller image to match the larger image's dimensions using nearest neighbor interpolation.
+    """
+    img1_path = image1_path if image1_path else uploaded_img1
+    img2_path = image2_path if image2_path else uploaded_img2
+    
+    if not img1_path or not img2_path:
+        return gr.update(visible=False), gr.update(value="Please select two images to compare")
+    
+    try:
+        img1 = safe_open_image(img1_path)
+        img2 = safe_open_image(img2_path)
+        
+        # Get dimensions of both images
+        width1, height1 = img1.size
+        width2, height2 = img2.size
+        
+        # Determine which image is larger
+        if (width1 * height1) > (width2 * height2):
+            # img1 is larger, resize img2 to match img1's dimensions
+            img2 = img2.resize((width1, height1), Image.NEAREST)
+        elif (width2 * height2) > (width1 * height1):
+            # img2 is larger, resize img1 to match img2's dimensions
+            img1 = img1.resize((width2, height2), Image.NEAREST)
+        
+        message = f"Comparing: {os.path.basename(img1_path)} and {os.path.basename(img2_path)}"
+        return gr.update(visible=True, value=(img1, img2)), gr.update(value=message)
+    except Exception as e:
+        return gr.update(visible=False), gr.update(value=f"Error loading images: {str(e)}")
+
+def toggle_compare_fullscreen():
+    """Toggle fullscreen for the comparison slider."""
+    # Returns compare_result_col, fullscreen button, download button
+    return (
+        gr.update(elem_classes=["preview_col", "full_preview"]), 
+        gr.update(elem_classes=["slider_button", "full"]), 
+        gr.update(elem_classes=["slider_button", "full"])
+    )
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--ip", type=str, default='127.0.0.1', help="IP address for the server to listen on.")
 parser.add_argument("--share", type=str, default=False, help="Set to True to share the app publicly.")
@@ -1852,23 +2073,28 @@ with open(slider_css_file) as f:
 
 js_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'javascript', 'demo.js'))
 no_slider_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'javascript', 'nouislider.min.js'))
+compare_fullscreen_file = os.path.abspath(os.path.join(os.path.dirname(__file__), 'javascript', 'compare_fullscreen.js'))
 
 with open(js_file) as f:
     js = f.read()
 
 with open(no_slider_file) as f:
     no_slider = f.read()
+    
+with open(compare_fullscreen_file) as f:
+    compare_fullscreen_js = f.read()
 
 head = f"""
 <style media="screen">{css}</style>
 <style media="screen">{slider_css}</style>
 <script type="text/javascript">{js}</script>
 <script type="text/javascript">{no_slider}</script>
+<script type="text/javascript">{compare_fullscreen_js}</script>
 """
 
 refresh_symbol = "\U000027F3"  # ⟳
 dl_symbol = "\U00002B73"  # ⭳
-fullscreen_symbol = "\U000026F6"  # ⛶
+fullscreen_symbol = "⛶"  # Simple fullscreen arrow that works across fonts
 
 
 def update_meta(selected_file):
@@ -1903,7 +2129,10 @@ selected_pos, selected_neg, llava_style_prompt = select_style(
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
 
 with (block):
-    gr.Markdown("SUPIR V68 - https://www.patreon.com/posts/99176057")
+    gr.Markdown("SUPIR V69 - https://www.patreon.com/posts/99176057")
+    
+    def do_nothing():
+        pass
         
     with gr.Tab("Upscale"):
         # Execution buttons
@@ -2305,6 +2534,78 @@ with (block):
                 meta_video = gr.Video(label="Output Video", elem_id="output_video", visible=False, height="42.5vh")
                 metadata_output = gr.Textbox(label="Image Metadata", lines=25, max_lines=50, elem_id="output_metadata")
 
+    with gr.Tab("Compare Images", elem_id="compare_tab"):
+        with gr.Column():
+            compare_status = gr.HTML(value="Select one image from each gallery below", elem_id="compare_status")
+            with gr.Row():
+                refresh_compare_btn = gr.Button(value=f"{refresh_symbol} Refresh Image List", elem_id="refresh_compare_btn")
+                toggle_fullscreen_btn = gr.Button(value=f"{fullscreen_symbol} Toggle Fullscreen", elem_id="toggle_fullscreen_compare_btn")
+            
+            with gr.Row():
+                # Two separate galleries side by side
+                with gr.Column(scale=1):
+                    gr.Markdown("### Select First Image")
+                    compare_gallery1 = gr.Gallery(
+                        value=get_recent_images(20),
+                        label="Image 1",
+                        elem_id="compare_gallery1",
+                        columns=4,
+                        rows=2,
+                        height=300,
+                        object_fit="contain"
+                    )
+                
+                with gr.Column(scale=1):
+                    gr.Markdown("### Select Second Image")
+                    compare_gallery2 = gr.Gallery(
+                        value=get_recent_images(20),
+                        label="Image 2", 
+                        elem_id="compare_gallery2",
+                        columns=4,
+                        rows=2,
+                        height=300,
+                        object_fit="contain"
+                    )
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    # Upload option for first image
+                    compare_img1_upload = gr.Image(
+                        label="Or upload image 1", 
+                        type="filepath",
+                        elem_id="compare_img1_upload",
+                        height=300
+                    )
+                    image1_path = gr.Textbox(value="", visible=False) # Hidden storage for selected image 1 path
+                
+                with gr.Column(scale=1):
+                    # Upload option for second image
+                    compare_img2_upload = gr.Image(
+                        label="Or upload image 2", 
+                        type="filepath",
+                        elem_id="compare_img2_upload",
+                        height=300
+                    )
+                    image2_path = gr.Textbox(value="", visible=False) # Hidden storage for selected image 2 path
+            
+            with gr.Row():
+                compare_btn = gr.Button(value="Compare Selected Images", elem_id="compare_btn")
+                compare_fullscreen_btn = gr.Button(value="Toggle Fullscreen", elem_id="test_fullscreen_btn")
+            
+            with gr.Column(elem_classes=['preview_col'], elem_id="compare_preview_column") as compare_result_col:
+                compare_result_gallery = gr.Gallery(label='Comparison Results', elem_id="compare_gallery2", elem_classes=["preview_box"],
+                                            height=400, visible=False, rows=2, columns=4, allow_preview=True,
+                                            show_download_button=False, show_share_button=False)
+                compare_slider = ImageSlider(label='Image Comparison', interactive=False, show_download_button=True,
+                                            elem_id="compare_slider",
+                                            elem_classes=["preview_box", "preview_slider", "active"],
+                                            height=500, container=True, visible=False)
+                compare_result_video = gr.Video(label="Comparison Video", elem_classes=["preview_box"], height=400, visible=False)
+                compare_slider_dl_button = gr.Button(value=dl_symbol, elem_classes=["slider_button"], visible=True,
+                                                 elem_id="compare_download_button")
+                compare_slider_full_button = gr.Button(value=fullscreen_symbol, elem_classes=["slider_button"], visible=True,
+                                                    elem_id="compare_fullscreen_button")
+
     with gr.Tab("Download Checkpoints"):
         gr.Markdown("## Download Checkpoints")
         with gr.Row():
@@ -2452,6 +2753,7 @@ with (block):
     # slider_dl_button.click(fn=download_slider_image, inputs=[result_slider], show_progress=False, queue=True)
     slider_full_button.click(fn=toggle_full_preview, outputs=[result_col, slider_full_button, slider_dl_button],
                              show_progress=False, queue=True, js="toggleFullscreen")
+    slider_dl_button.click(js="downloadImage", show_progress=False, queue=True, fn=do_nothing)
 
     input_elements = [src_input_file, src_image_display, video_slider_display, target_res_textbox,
                       video_start_time_number, video_end_time_number, video_current_time_number, video_fps_number,
@@ -2492,12 +2794,114 @@ with (block):
 
     apply_metadata_button.click(fn=apply_metadata, inputs=[meta_image], outputs=[output_label] + elements + elements_extra,
                 show_progress=True, queue=True)
-
-    def do_nothing():
-        pass
-
-
-    slider_dl_button.click(js="downloadImage", show_progress=False, queue=True, fn=do_nothing)
+    
+    # Event handlers for the Compare Images tab
+    # Note: This handler is superseded by the more comprehensive one below that also clears selected images
+    # refresh_compare_btn.click(
+    #    fn=refresh_image_list,
+    #    outputs=[compare_gallery],
+    #    show_progress=True,
+    #    queue=True
+    # )
+    
+    # Function to handle comparison with uploaded images
+    def compare_uploaded_images(img1_path, img2_path):
+        if img1_path and img2_path:
+            return update_comparison_images(img1_path, img2_path)
+        else:
+            return gr.update(visible=False), gr.update(value="Please select two images to compare")
+    
+    # Compare button event handler
+    compare_btn.click(
+        fn=compare_selected_images,
+        inputs=[image1_path, image2_path, compare_img1_upload, compare_img2_upload],
+        outputs=[compare_slider, compare_status],
+        show_progress=True,
+        queue=True
+    )
+    
+    # Gallery selection handler
+    compare_gallery1.select(
+        fn=on_image_select_gallery1,
+        inputs=[compare_gallery1],
+        outputs=[compare_status, compare_slider, image1_path],
+        show_progress=True,
+        queue=True
+    )
+    
+    compare_gallery2.select(
+        fn=on_image_select_gallery2,
+        inputs=[compare_gallery2],
+        outputs=[compare_status, compare_slider, image2_path],
+        show_progress=True,
+        queue=True
+    )
+    
+    # Refresh and clear selections
+    refresh_compare_btn.click(
+        fn=clear_selected_images,
+        outputs=[compare_gallery1, compare_gallery2, compare_status, compare_slider, image1_path, image2_path],
+        show_progress=True,
+        queue=True
+    )
+    
+    # Handle when both uploads have images
+    def check_uploads(img1_path, img2_path):
+        if img1_path and img2_path:
+            return update_comparison_images(img1_path, img2_path)
+        return gr.update(), gr.update()
+    
+    # Watch both uploads
+    compare_img1_upload.change(
+        fn=check_uploads,
+        inputs=[compare_img1_upload, compare_img2_upload],
+        outputs=[compare_slider, compare_status],
+        show_progress=True,
+        queue=True
+    )
+    
+    compare_img2_upload.change(
+        fn=check_uploads,
+        inputs=[compare_img1_upload, compare_img2_upload],
+        outputs=[compare_slider, compare_status],
+        show_progress=True,
+        queue=True
+    )
+    
+    # Fullscreen toggle for comparison slider
+    compare_slider_full_button.click(
+        fn=toggle_compare_fullscreen,
+        outputs=[compare_result_col, compare_slider_full_button, compare_slider_dl_button],
+        show_progress=False,
+        queue=True,
+        js="toggleCompareFullscreen"
+    )
+    
+    # Add download functionality
+    compare_slider_dl_button.click(
+        js="downloadImage",
+        show_progress=False,
+        queue=True,
+        fn=do_nothing
+    )
+    
+    # Add direct fullscreen toggle button handler
+    compare_fullscreen_btn.click(
+        fn=toggle_compare_fullscreen,
+        outputs=[compare_result_col, compare_slider_full_button, compare_slider_dl_button],
+        show_progress=False,
+        queue=True,
+        js="toggleCompareFullscreen"
+    )
+    
+    # Connect the new toggle button in the top row
+    toggle_fullscreen_btn.click(
+        fn=toggle_compare_fullscreen,
+        outputs=[compare_result_col, compare_slider_full_button, compare_slider_dl_button],
+        show_progress=False,
+        queue=True,
+        js="toggleCompareFullscreen"
+    )
 
 if args.port is not None:  # Check if the --port argument is provided
     # Remove direct loading here as it won't work
