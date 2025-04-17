@@ -252,14 +252,17 @@ def compare_selected_images(image1_path, image2_path, uploaded_img1=None, upload
     except Exception as e:
         return gr.update(visible=False), gr.update(value=f"Error loading images: {str(e)}")
 
+# Comment out toggle_compare_fullscreen function
+"""
 def toggle_compare_fullscreen():
-    """Toggle fullscreen for the comparison slider."""
+    # Toggle fullscreen for the comparison slider.
     # Returns compare_result_col, fullscreen button, download button
     return (
         gr.update(elem_classes=["preview_col", "full_preview"]), 
         gr.update(elem_classes=["slider_button", "full"]), 
         gr.update(elem_classes=["slider_button", "full"])
     )
+"""
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--ip", type=str, default='127.0.0.1', help="IP address for the server to listen on.")
@@ -2020,6 +2023,8 @@ def submit_feedback(evt_id, f_score, f_text):
         return 'Submit failed, the server is not set to log history.'
 
 
+# Comment out toggle_full_preview function
+"""
 preview_full = False
 
 
@@ -2035,7 +2040,7 @@ def toggle_full_preview():
         gal_classes.append("full_preview")
         btn_classes.append("full")
     return gr.update(elem_classes=gal_classes), gr.update(elem_classes=btn_classes), gr.update(elem_classes=btn_classes)
-
+"""
 
 def toggle_compare_elements(enable: bool) -> Tuple[gr.update, gr.update]:
     return gr.update(visible=enable), gr.update(visible=enable), gr.update(visible=enable)
@@ -2090,6 +2095,47 @@ head = f"""
 <script type="text/javascript">{js}</script>
 <script type="text/javascript">{no_slider}</script>
 <script type="text/javascript">{compare_fullscreen_js}</script>
+<script>
+// Modified downloadImage function to accept sliderId
+function downloadImage(sliderId) {{
+    console.log("Attempting download for slider:", sliderId);
+    const slider = document.getElementById(sliderId);
+    if (!slider) {{
+        console.error("Download failed: Slider element not found:", sliderId);
+        return;
+    }}
+    // Try common structures for the *second* image (usually the processed one)
+    let img = slider.querySelector('.noUi-origin[style*="z-index: 5"] img'); // ImageSlider often uses this for the top image
+    if (!img) img = slider.querySelector('.noUi-base > div:nth-of-type(2) img'); // Alternative structure
+    if (!img) img = slider.querySelector('.image-zoom-wrapper > img:nth-of-type(2)'); // If using custom wrapper
+    if (!img) img = slider.querySelector('img:nth-of-type(2)'); // Generic fallback
+
+    if (img && img.src) {{
+        console.log("Found image source:", img.src);
+        const link = document.createElement('a');
+        let filename = 'downloaded_image.png';
+        try {{
+             // Basic filename extraction from URL
+             const urlParts = img.src.split('/');
+             const potentialFilename = urlParts[urlParts.length - 1];
+             // Basic check to avoid data URIs or weird names
+             if (potentialFilename && potentialFilename.includes('.')) {{
+                 filename = potentialFilename.split('?')[0]; // Remove query params if any
+             }}
+        }} catch (e) {{ console.error("Error parsing img src for filename", e); }}
+
+        link.href = img.src;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        console.log("Download initiated for:", filename);
+    }} else {{
+        console.error('Could not find image source to download for slider:', sliderId, "Tried selectors, found:", img);
+        alert("Could not find the image source to download.");
+    }}
+}}
+</script>
 """
 
 refresh_symbol = "\U000027F3"  # ⟳
@@ -2129,7 +2175,7 @@ selected_pos, selected_neg, llava_style_prompt = select_style(
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
 
 with (block):
-    gr.Markdown("SUPIR V69 - https://www.patreon.com/posts/99176057")
+    gr.Markdown("SUPIR V70 - https://www.patreon.com/posts/99176057")
     
     def do_nothing():
         pass
@@ -2751,9 +2797,21 @@ with (block):
                          outputs=[target_res_textbox])
 
     # slider_dl_button.click(fn=download_slider_image, inputs=[result_slider], show_progress=False, queue=True)
-    slider_full_button.click(fn=toggle_full_preview, outputs=[result_col, slider_full_button, slider_dl_button],
-                             show_progress=False, queue=True, js="toggleFullscreen")
-    slider_dl_button.click(js="downloadImage", show_progress=False, queue=True, fn=do_nothing)
+    slider_full_button.click(
+        fn=None, # No Python function needed, just JS
+        inputs=None,
+        outputs=None,
+        show_progress=False,
+        queue=False, # Can be false as it's pure JS
+        # Call the JS function with IDs for upscale tab elements
+        js="() => toggleSliderFullscreen('gallery1', 'preview_column', 'fullscreen_button', 'download_button')"
+    )
+    slider_dl_button.click(
+        js="() => downloadImage('gallery1')",
+        show_progress=False, 
+        queue=True, 
+        fn=do_nothing
+    )
 
     input_elements = [src_input_file, src_image_display, video_slider_display, target_res_textbox,
                       video_start_time_number, video_end_time_number, video_current_time_number, video_fps_number,
@@ -2870,16 +2928,18 @@ with (block):
     
     # Fullscreen toggle for comparison slider
     compare_slider_full_button.click(
-        fn=toggle_compare_fullscreen,
-        outputs=[compare_result_col, compare_slider_full_button, compare_slider_dl_button],
+        fn=None, # No Python function needed
+        inputs=None,
+        outputs=None,
         show_progress=False,
-        queue=True,
-        js="toggleCompareFullscreen"
+        queue=False,
+        # Call the JS function with IDs for compare tab elements
+        js="() => toggleSliderFullscreen('compare_slider', 'compare_preview_column', 'compare_fullscreen_button', 'compare_download_button')"
     )
     
     # Add download functionality
     compare_slider_dl_button.click(
-        js="downloadImage",
+        js="() => downloadImage('compare_slider')", # Pass the slider ID
         show_progress=False,
         queue=True,
         fn=do_nothing
@@ -2887,20 +2947,24 @@ with (block):
     
     # Add direct fullscreen toggle button handler
     compare_fullscreen_btn.click(
-        fn=toggle_compare_fullscreen,
-        outputs=[compare_result_col, compare_slider_full_button, compare_slider_dl_button],
+        fn=None, # No Python function needed
+        inputs=None,
+        outputs=None,
         show_progress=False,
-        queue=True,
-        js="toggleCompareFullscreen"
+        queue=False,
+        # This targets the compare slider by default
+        js="() => toggleSliderFullscreen('compare_slider', 'compare_preview_column', 'compare_fullscreen_button', 'compare_download_button')"
     )
     
-    # Connect the new toggle button in the top row
+    # Update the top row fullscreen toggle button handler
     toggle_fullscreen_btn.click(
-        fn=toggle_compare_fullscreen,
-        outputs=[compare_result_col, compare_slider_full_button, compare_slider_dl_button],
+        fn=None, # No Python function needed
+        inputs=None,
+        outputs=None,
         show_progress=False,
-        queue=True,
-        js="toggleCompareFullscreen"
+        queue=False,
+        # This targets the compare slider by default
+        js="() => toggleSliderFullscreen('compare_slider', 'compare_preview_column', 'compare_fullscreen_button', 'compare_download_button')"
     )
 
 if args.port is not None:  # Check if the --port argument is provided
