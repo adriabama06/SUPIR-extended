@@ -1299,7 +1299,7 @@ def start_batch_process(*element_values):
     return result
 
 
-def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions=False, progress=gr.Progress()):
+def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions=False, progress=gr.Progress(), skip_llava_if_txt_exists: bool = True):
     global llava_agent, status_container
     outputs = []
     total_steps = len(inputs) + 1
@@ -1317,8 +1317,8 @@ def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions
         
         # Check if filename.txt exists - if it does, skip LLaVA processing for this image
         txt_path = os.path.splitext(img_path)[0] + ".txt"
-        if os.path.exists(txt_path):
-            printt(f"Found {txt_path}, skipping LLaVA for this image")
+        if skip_llava_if_txt_exists and os.path.exists(txt_path):
+            printt(f"Found {txt_path}, skipping LLaVA for this image (override active)")
             # Read caption from the text file instead
             with open(txt_path, 'r') as f:
                 caption = f.read().strip()
@@ -1709,7 +1709,7 @@ def batch_process(img_data,
                   diff_dtype, edm_steps, face_prompt, face_resolution, linear_CFG, linear_s_stage2,
                   make_comparison_video, model_select, n_prompt, num_images, num_samples, qs, random_seed,
                   s_cfg, s_churn, s_noise, s_stage1, s_stage2, sampler, save_captions, seed, spt_linear_CFG,
-                  spt_linear_s_stage2, temperature, top_p, upscale, max_megapixels, max_resolution, auto_unload_llava, progress=gr.Progress()
+                  spt_linear_s_stage2, temperature, top_p, upscale, max_megapixels, max_resolution, auto_unload_llava, skip_llava_if_txt_exists, progress=gr.Progress()
                   ):
     global is_processing, llava_agent, model, status_container
     
@@ -1794,7 +1794,7 @@ def batch_process(img_data,
     printt(f"Processing {total_images} images...", reset=True)
     if apply_llava:
         printt('Processing LLaVA')
-        last_result = llava_process(img_data, temperature, top_p, qs, save_captions, progress=progress)
+        last_result = llava_process(img_data, temperature, top_p, qs, save_captions, progress=progress, skip_llava_if_txt_exists=skip_llava_if_txt_exists)
         printt('LLaVA processing completed')
 
         if auto_unload_llava:
@@ -2175,7 +2175,7 @@ selected_pos, selected_neg, llava_style_prompt = select_style(
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
 
 with (block):
-    gr.Markdown("SUPIR V70 - https://www.patreon.com/posts/99176057")
+    gr.Markdown("SUPIR V71 - https://www.patreon.com/posts/99176057")
     
     def do_nothing():
         pass
@@ -2284,41 +2284,21 @@ with (block):
                     qs_textbox = gr.Textbox(label="LLaVA prompt",value=llava_style_prompt)
                     temperature_slider = gr.Slider(label="Temperature", minimum=0., maximum=1.0, value=0.2, step=0.1)
                     top_p_slider = gr.Slider(label="Top P", minimum=0., maximum=1.0, value=0.7, step=0.1)
-
-                with gr.Accordion("SUPIR options", open=False):
+                    skip_llava_if_txt_exists_checkbox = gr.Checkbox(label="Skip LLaVA if .txt caption exists", value=True) # Default to True to maintain original behavior
+                with gr.Accordion("Comparison Video options", open=False):
                     with gr.Row():
-                        with gr.Column():
-                            num_images_slider = gr.Slider(label="Number Of Images To Generate", minimum=1, maximum=200
-                                                          , value=1, step=1)
-                            num_samples_slider = gr.Slider(label="Batch Size", minimum=1,
-                                                           maximum=4, value=1, step=1)
-                        with gr.Column():
-                            random_seed_checkbox = gr.Checkbox(label="Randomize Seed", value=True)
-                    with gr.Row():
-                        edm_steps_slider = gr.Slider(label="Steps", minimum=1, maximum=200, value=50, step=1)
-                        s_cfg_slider = gr.Slider(label="Text Guidance Scale", minimum=1.0, maximum=15.0, value=3.0,
-                                                 step=0.1)
-                        s_stage2_slider = gr.Slider(label="Stage2 Guidance Strength", minimum=0., maximum=1., value=1.,
-                                                    step=0.05)
-                        s_stage1_slider = gr.Slider(label="Stage1 Guidance Strength", minimum=-1.0, maximum=6.0,
-                                                    value=-1.0,
-                                                    step=1.0)
-                        seed_slider = gr.Slider(label="Seed", minimum=-1, maximum=2147483647, step=1, randomize=True)
-                        sampler_dropdown = gr.Dropdown(label="Sampler", choices=["EDM", "DPMPP2M"],
-                                                       value="EDM")
-                        s_churn_slider = gr.Slider(label="S-Churn", minimum=0, maximum=40, value=5, step=1)
-                        s_noise_slider = gr.Slider(label="S-Noise", minimum=1.0, maximum=1.1, value=1.003, step=0.001)
-
-                    with gr.Row():
-                        a_prompt_textbox = gr.Textbox(label="Default Positive Prompt",
-                                                      value=selected_pos)
-                        n_prompt_textbox = gr.Textbox(label="Default Negative Prompt",
-                                                      value=selected_neg)
-                with gr.Accordion("Video options", open=False):
-                    with gr.Column():
                         output_vq_slider = gr.Slider(label="Output Video Quality", minimum=0.1, maximum=1.0, value=0.6,
                                                      step=0.1)
                         output_vf_dropdown = gr.Dropdown(label="Video Format", choices=["mp4", "mkv"], value="mp4")
+                    with gr.Row():
+                        make_comparison_video_checkbox = gr.Checkbox(
+                            label="Generate Comparison Video", value=False)
+                    with gr.Row(visible=True) as compare_video_row:
+                        video_duration_textbox = gr.Textbox(label="Duration", value="5")
+                        video_fps_textbox = gr.Textbox(label="FPS", value="30")
+                        video_width_textbox = gr.Textbox(label="Width", value="1920")
+                        video_height_textbox = gr.Textbox(label="Height", value="1080")
+
 
             with gr.Column():
                 with gr.Accordion("Batch options", open=True):
@@ -2336,6 +2316,36 @@ with (block):
                                 placeholder="R:\SUPIR video\comparison_images\outputs")
                             save_captions_checkbox = gr.Checkbox(label="Save Captions",
                                                                  value=True)
+
+                with gr.Accordion("SUPIR options", open=False):
+                    with gr.Row():
+                        with gr.Column():
+                            num_images_slider = gr.Slider(label="Number Of Images To Generate", minimum=1, maximum=200
+                                                          , value=1, step=1)
+                            num_samples_slider = gr.Slider(label="Batch Size", minimum=1,
+                                                           maximum=4, value=1, step=1)
+                        with gr.Column():
+                            random_seed_checkbox = gr.Checkbox(label="Randomize Seed", value=True)
+                    with gr.Row():
+                        edm_steps_slider = gr.Slider(label="Steps", minimum=1, maximum=200, value=50, step=1)
+                        s_cfg_slider = gr.Slider(label="Text Guidance Scale", minimum=1.0, maximum=15.0, value=3.0,
+                                                 step=0.1)
+                        s_stage2_slider = gr.Slider(label="Stage2 Guidance Strength", minimum=0., maximum=2., value=1.,
+                                                    step=0.05)
+                        s_stage1_slider = gr.Slider(label="Stage1 Guidance Strength", minimum=-1.0, maximum=6.0,
+                                                    value=-1.0,
+                                                    step=1.0)
+                        seed_slider = gr.Slider(label="Seed", minimum=-1, maximum=2147483647, step=1, randomize=True)
+                        sampler_dropdown = gr.Dropdown(label="Sampler", choices=["EDM", "DPMPP2M"],
+                                                       value="EDM")
+                        s_churn_slider = gr.Slider(label="S-Churn", minimum=0, maximum=40, value=5, step=1)
+                        s_noise_slider = gr.Slider(label="S-Noise", minimum=1.0, maximum=1.1, value=1.003, step=0.001)
+
+                    with gr.Row():
+                        a_prompt_textbox = gr.Textbox(label="Default Positive Prompt",
+                                                      value=selected_pos)
+                        n_prompt_textbox = gr.Textbox(label="Default Negative Prompt",
+                                                      value=selected_neg)
                 with gr.Accordion("Advanced options", open=False):
                     with gr.Row():
                         with gr.Column():
@@ -2377,15 +2387,7 @@ with (block):
                             apply_bg_checkbox = gr.Checkbox(label="BG restoration", value=False)
                         with gr.Column():
                             apply_face_checkbox = gr.Checkbox(label="Face restoration", value=False)
-                with gr.Accordion("Comparison Video options", open=False):
-                    with gr.Row():
-                        make_comparison_video_checkbox = gr.Checkbox(
-                            label="Generate Comparison Video", value=False)
-                    with gr.Row(visible=True) as compare_video_row:
-                        video_duration_textbox = gr.Textbox(label="Duration", value="5")
-                        video_fps_textbox = gr.Textbox(label="FPS", value="30")
-                        video_width_textbox = gr.Textbox(label="Width", value="1920")
-                        video_height_textbox = gr.Textbox(label="Height", value="1080")
+
 
                 with gr.Accordion("Presets", open=True):
                     presets_dir = os.path.join(os.path.dirname(__file__), 'presets')
@@ -2734,6 +2736,7 @@ with (block):
         "seed": seed_slider,
         "spt_linear_CFG": spt_linear_cfg_slider,
         "spt_linear_s_stage2": spt_linear_s_stage2_slider,
+        "skip_llava_if_txt_exists": skip_llava_if_txt_exists_checkbox, # Added new checkbox
         "src_file": src_input_file,
         "temperature": temperature_slider,
         "top_p": top_p_slider,
