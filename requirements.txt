@@ -1,4 +1,3 @@
---extra-index-url https://download.pytorch.org/whl/cu124
 gradio==4.19.0
 gradio_imageslider
 gradio_client
@@ -39,11 +38,5 @@ webdataset==0.2.86
 fastapi==0.111.0
 diffusers
 facexlib==0.3.0
-torch==2.5.1
-torchvision
-torchaudio
 huggingface_hub
-xformers==0.0.28.post3
 pillow-avif-plugin
-
-
