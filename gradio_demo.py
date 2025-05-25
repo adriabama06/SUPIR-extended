@@ -2046,6 +2046,14 @@ def toggle_compare_elements(enable: bool) -> Tuple[gr.update, gr.update]:
     return gr.update(visible=enable), gr.update(visible=enable), gr.update(visible=enable)
 
 
+def auto_enable_bg_restore(face_restore_enabled):
+    """
+    Automatically enable background restore when face restore is enabled.
+    This merges the behavior so users don't need to manage both checkboxes.
+    """
+    return gr.update(value=face_restore_enabled)
+
+
 title_md = """
 # **SUPIR: Practicing Model Scaling for Photo-Realistic Image Restoration**
 
@@ -2384,7 +2392,7 @@ with (block):
                                                        step=32)
                     with gr.Row():
                         with gr.Column():
-                            apply_bg_checkbox = gr.Checkbox(label="BG restoration", value=False)
+                            apply_bg_checkbox = gr.Checkbox(label="BG restoration", value=False, visible=False)
                         with gr.Column():
                             apply_face_checkbox = gr.Checkbox(label="Face restoration", value=False)
 
@@ -2786,6 +2794,10 @@ with (block):
 
     make_comparison_video_checkbox.change(fn=toggle_compare_elements, inputs=[make_comparison_video_checkbox],
                                           outputs=[comparison_video_col, compare_video_row, comparison_video])
+    
+    # Auto-enable background restore when face restore is enabled
+    apply_face_checkbox.change(fn=auto_enable_bg_restore, inputs=[apply_face_checkbox], outputs=[apply_bg_checkbox])
+    
     submit_button.click(fn=submit_feedback, inputs=[event_id, fb_score, fb_text], outputs=[fb_text])
     upscale_slider.change(fn=update_target_resolution, inputs=[src_image_display, upscale_slider, max_mp_slider, max_res_slider],
                           outputs=[target_res_textbox])
