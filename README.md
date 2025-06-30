@@ -1,3 +1,15 @@
+# Docker version of the [fork of SUPIR of FurkanGozukara](https://github.com/FurkanGozukara/SUPIR)
+
+# Installation/Deploy
+```bash
+git clone https://github.com/adriabama06/SUPIR-extended.git
+cd SUPIR-extended
+docker compose up -d
+# Use the following command to check the progress
+docker compose logs -f
+```
+The gradio will be avilabe at IP:6688
+
 # Ultra Advanced SUPIR App With So Many Features and 1-Click Install
 
 ## Download and use : https://www.patreon.com/posts/99176057
