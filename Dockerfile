@@ -16,9 +16,13 @@ RUN pip install --no-cache-dir -r requirements_static.txt
 # Copy the repository files
 COPY . .
 
+# Create outputs folder
+RUN mkdir -p ./outputs
+
 # Define port and volume
 EXPOSE 6688
 VOLUME [ "/app/models" ]
+VOLUME [ "/app/outputs" ]
 
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
 

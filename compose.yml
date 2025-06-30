@@ -16,6 +16,7 @@ services:
       - 6688:6688
     volumes:
       - models:/app/models
+      - outputs:/app/outputs
       - ./entrypoint.sh:/app/entrypoint.sh
     deploy:
       resources:
@@ -32,3 +33,9 @@ volumes:
       type: none
       o: bind
       device: ./models
+  outputs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./outputs
