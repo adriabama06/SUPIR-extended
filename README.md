@@ -10,6 +10,11 @@ docker compose logs -f
 ```
 The gradio will be avilabe at IP:6688
 
+Todo:
+- [ ] Use OpenAI client to generate image captions
+- [ ] Use Flux to generate images
+- [ ] Use Flux Kontext also?
+
 # Ultra Advanced SUPIR App With So Many Features and 1-Click Install
 
 ## Download and use : https://www.patreon.com/posts/99176057
