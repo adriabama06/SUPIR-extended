@@ -14,6 +14,12 @@ services:
       timeout: 10s
     ports:
       - 6688:6688
+    environment:
+      - OPENAI_API_BASE=https://api.openai.com/v1 # If you use ollama also set the url using /v1
+      - OPENAI_API_KEY=NOT-SET
+      - OPENAI_MODEL=gpt-4o-mini
+      - OPENAI_BACKEND=ollama # ollama | tabbyapi <-- This is used to unload the model to free up memory, set any other string to not unload, example: OPENAI_BACKEND=none
+      - USE_OPENAI=off # on | off <-- off will indicate that llava will be used
     volumes:
       - models:/app/models
       - outputs:/app/outputs

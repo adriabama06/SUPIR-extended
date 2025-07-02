@@ -756,6 +756,49 @@ def unload_llava():
         torch.cuda.empty_cache()
         printt("LLaVA unloaded.")
 
+# Maybe the user is using ollama or anything that want to unload to free up memory
+def unload_openai():
+    backend = os.environ.get("OPENAI_BACKEND")
+
+    if backend == None:
+        printt("WARNING: OPENAI_BACKEND not set, we will not unload anything")
+
+    openai_api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    openai_model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+    if backend == "tabbyapi":
+        url = f"{openai_api_base}/model/unload"
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {openai_api_key}'
+        }
+
+        response = requests.post(url, headers=headers)
+
+        if response.status_code == 200:
+            print("Success: TabbyAPI unload")
+        else:
+            print("Error:", response.status_code, response.text)
+    else if backend == "ollama":
+        url = f"{openai_api_base.rstrip("/v1")}/api/generate"
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {openai_api_key}'
+        }
+
+        data = {
+            'model': openai_model,
+            'keep_alive': 0 # This will unload the model
+        }
+
+        response = requests.post(url, headers=headers, json=data)
+
+        if response.status_code == 200:
+            print("Success:", response.json())
+        else:
+            print("Error:", response.status_code, response.text)
 
 def clear_llava():
     global llava_agent
@@ -1350,6 +1393,92 @@ def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions
     status_container.image_data = outputs
     return f"LLaVA Processing Completed: {len(inputs)} images processed at {time.ctime()}."
 
+def openai_process(inputs: List[MediaData], temp, p, question=None, save_captions=False, progress=gr.Progress(), skip_llava_if_txt_exists: bool = True):
+    """
+    Generate captions for images using the OpenAI API. Allows custom API host and model via environment variables:
+    - OPENAI_API_BASE: Custom API base URL (Example: sglang, vllm, ollama)
+    - OPENAI_API_KEY: API key
+    - OPENAI_MODEL: Model name (By default: 'gpt-4o-mini')
+    """
+    import os
+    import openai
+    import requests
+    from io import BytesIO
+    
+    global status_container
+    outputs = []
+    total_steps = len(inputs) + 1
+    step = 0
+    progress(step / total_steps, desc="Loading OpenAI API...")
+
+    # Get OpenAI API settings from environment
+    openai_api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    openai_model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    if not openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY environment variable not set.")
+    openai.api_key = openai_api_key
+    openai.api_base = openai_api_base
+
+    step += 1
+    progress(step / total_steps, desc="OpenAI API loaded, captioning images...")
+    for md in inputs:
+        img = md.media_data
+        img_path = md.media_path
+        txt_path = os.path.splitext(img_path)[0] + ".txt"
+        if skip_llava_if_txt_exists and os.path.exists(txt_path):
+            printt(f"Found {txt_path}, skipping OpenAI for this image (override active)")
+            with open(txt_path, 'r') as f:
+                caption = f.read().strip()
+            md.caption = caption
+            outputs.append(md)
+            step += 1
+            progress(step / total_steps, desc=f"Skipped OpenAI for image {step}/{len(inputs)}, using existing text file")
+            continue
+
+        progress(step / total_steps, desc=f"Processing image {step}/{len(inputs)} with OpenAI...")
+        if img is None:
+            img = safe_open_image(img_path)
+            img = np.array(img)
+        lq = HWC3(img)
+        lq = Image.fromarray(lq.astype('uint8'))
+        # Convert image to bytes for OpenAI API
+        buf = BytesIO()
+        lq.save(buf, format='PNG')
+        buf.seek(0)
+        image_bytes = buf.read()
+        # Prepare the prompt
+        prompt = question if question else "Describe this image and its style in a very detailed manner." # Default prompt extracted from llava/llava_agent.py:36
+        # Call OpenAI API (vision model)
+        try:
+            response = openai.chat.completions.create(
+                model=openai_model,
+                messages=[
+                    {"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(image_bytes).decode()}}
+                    ]}
+                ],
+                temperature=temp,
+                top_p=p
+                max_tokens=1024 # Set max tokens?
+            )
+            caption = response.choices[0].message.content.strip()
+        except Exception as e:
+            caption = ""
+        md.caption = caption
+        outputs.append(md)
+        if save_captions:
+            cap_path = os.path.splitext(img_path)[0] + ".txt"
+            with open(cap_path, 'w') as cf:
+                cf.write(caption)
+        if not is_processing:
+            break
+        step += 1
+
+    progress(step / total_steps, desc="OpenAI processing completed.")
+    status_container.image_data = outputs
+    return f"OpenAI Processing Completed: {len(inputs)} images processed at {time.ctime()}."
 
 # video_start_time_number, video_current_time_number, video_end_time_number,
 #                      video_fps_number, video_total_frames_number, src_input_file, upscale_slider
@@ -1793,13 +1922,22 @@ def batch_process(img_data,
     progress(0, desc=f"Processing {total_images} images...")
     printt(f"Processing {total_images} images...", reset=True)
     if apply_llava:
-        printt('Processing LLaVA')
-        last_result = llava_process(img_data, temperature, top_p, qs, save_captions, progress=progress, skip_llava_if_txt_exists=skip_llava_if_txt_exists)
-        printt('LLaVA processing completed')
+        if os.environ.get("USE_OPENAI", "off") == "off":
+            printt('Processing LLaVA')
+            last_result = llava_process(img_data, temperature, top_p, qs, save_captions, progress=progress, skip_llava_if_txt_exists=skip_llava_if_txt_exists)
+            printt('LLaVA processing completed')
+        else:
+            printt('Processing OpenAI')
+            last_result = openai_process(img_data, temperature, top_p, qs, save_captions, progress=progress, skip_llava_if_txt_exists=skip_llava_if_txt_exists)
+            printt('OpenAI processing completed')
 
         if auto_unload_llava:
-            unload_llava()
-            printt('LLaVA unloaded')
+            if os.environ.get("USE_OPENAI", "off") == "off":
+                unload_llava()
+                printt('LLaVA unloaded')
+            else:
+                unload_openai()
+                printt('OpenAI unloaded')
 
         # Update the img_data from the captioner
         img_data = status_container.image_data
