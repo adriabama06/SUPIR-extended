@@ -76,13 +76,16 @@ if __name__ == '__main__':
     llava_clip_model = 'openai/clip-vit-large-patch14-336'
     sdxl_clip_model = 'openai/clip-vit-large-patch14'
 
-    print(f'Downloading LLaVA model: {llava_model}')
-    model_folder = llava_model.split('/')[1]
-    snapshot_download(llava_model, local_dir=os.path.join("models", model_folder))
+    if os.environ.get("SKIP_LLAVA_DOWNLOAD", "off") == "on":
+        print("Skipping the download of llava due SKIP_LLAVA_DOWNLOAD=on")
+    else:
+        print(f'Downloading LLaVA model: {llava_model}')
+        model_folder = llava_model.split('/')[1]
+        snapshot_download(llava_model, local_dir=os.path.join("models", model_folder))
 
-    print(f'Downloading LLaVA CLIP model: {llava_clip_model}')
-    model_folder = llava_clip_model.split('/')[1]
-    snapshot_download(llava_clip_model, local_dir=os.path.join("models", model_folder))
+        print(f'Downloading LLaVA CLIP model: {llava_clip_model}')
+        model_folder = llava_clip_model.split('/')[1]
+        snapshot_download(llava_clip_model, local_dir=os.path.join("models", model_folder))
 
     print(f'Downloading SDXL CLIP model: {sdxl_clip_model}')
     model_folder = sdxl_clip_model.split('/')[1]
