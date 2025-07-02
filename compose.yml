@@ -6,6 +6,8 @@ services:
       context: .
     network_mode: bridge
     container_name: supir-extended
+    tty: true
+    stdin_open: true
     healthcheck:
       test: curl --fail http://localhost:6688 || exit 1
       interval: 60s

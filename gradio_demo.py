@@ -1,4 +1,5 @@
 import argparse
+import base64
 import datetime
 import gc
 import os
@@ -11,7 +12,9 @@ import json
 from datetime import datetime
 from typing import Tuple, List, Any, Dict
 import subprocess
+from io import BytesIO
 
+import openai
 import einops
 import gradio as gr
 import numpy as np
@@ -781,7 +784,7 @@ def unload_openai():
         else:
             print("Error:", response.status_code, response.text)
     elif backend == "ollama":
-        url = f"{openai_api_base.rstrip("/v1")}/api/generate"
+        url = f"{openai_api_base.rstrip('/v1')}/api/generate"
         headers = {
             'Accept': 'application/json',
             'Content-Type': 'application/json',
@@ -1400,10 +1403,6 @@ def openai_process(inputs: List[MediaData], temp, p, question=None, save_caption
     - OPENAI_API_KEY: API key
     - OPENAI_MODEL: Model name (By default: 'gpt-4o-mini')
     """
-    import os
-    import openai
-    import requests
-    from io import BytesIO
     
     global status_container
     outputs = []
@@ -1417,8 +1416,10 @@ def openai_process(inputs: List[MediaData], temp, p, question=None, save_caption
     openai_model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     if not openai_api_key:
         raise RuntimeError("OPENAI_API_KEY environment variable not set.")
-    openai.api_key = openai_api_key
-    openai.api_base = openai_api_base
+    openai_client = openai.OpenAI(
+        base_url=openai_api_base,
+        api_key=openai_api_key
+    )
 
     step += 1
     progress(step / total_steps, desc="OpenAI API loaded, captioning images...")
@@ -1451,7 +1452,7 @@ def openai_process(inputs: List[MediaData], temp, p, question=None, save_caption
         prompt = question if question else "Describe this image and its style in a very detailed manner." # Default prompt extracted from llava/llava_agent.py:36
         # Call OpenAI API (vision model)
         try:
-            response = openai.chat.completions.create(
+            response = openai_client.chat.completions.create(
                 model=openai_model,
                 messages=[
                     {"role": "user", "content": [
@@ -1460,7 +1461,8 @@ def openai_process(inputs: List[MediaData], temp, p, question=None, save_caption
                     ]}
                 ],
                 temperature=temp,
-                top_p=p
+                top_p=p,
+                stream=False,
                 max_tokens=1024 # Set max tokens?
             )
             caption = response.choices[0].message.content.strip()

@@ -200,6 +200,7 @@ def printt(msg, progress=gr.Progress(), reset: bool = False):
         if not timer.print_log:
             timer.print_log = True
         timer.record(msg)
+        print(msg) # Make always debug on console
     else:
         print(msg)
     if graph:
