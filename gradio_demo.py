@@ -780,7 +780,7 @@ def unload_openai():
             print("Success: TabbyAPI unload")
         else:
             print("Error:", response.status_code, response.text)
-    else if backend == "ollama":
+    elif backend == "ollama":
         url = f"{openai_api_base.rstrip("/v1")}/api/generate"
         headers = {
             'Accept': 'application/json',
