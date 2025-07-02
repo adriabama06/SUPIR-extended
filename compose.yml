@@ -1,6 +1,6 @@
 services:
   supir-extended:
-    image: adriabama06/supir-extended
+    image: adriabama06/supir-extended # This image does not exist, is only to get this name in docker images and not an automatically generated name
     build:
       dockerfile: Dockerfile
       context: .
