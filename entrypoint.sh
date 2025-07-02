@@ -2,7 +2,7 @@
 
 if [ ! -f "models/.download_finished" ]; then
     mkdir -p models/checkpoints
-    echo "Model files not found. Running download_models.py..."
+    echo "'.download_finished' file not found. Running download_models.py..."
     python download_models.py
 fi
 
