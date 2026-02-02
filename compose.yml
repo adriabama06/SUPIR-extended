@@ -1,6 +1,6 @@
 services:
   supir-extended:
-    image: ghcr.io/adriabama06/supir-extended:master
+    image: adriabama06/supir-extended:latest
     build:
       dockerfile: Dockerfile
       context: .
@@ -33,7 +33,7 @@ services:
           devices:
             - driver: nvidia
               count: all # To use specifics GPUs --> device_ids: ['0']
-              capabilities: [gpu]
+              capabilities: [ gpu ]
 
 volumes:
   models:
