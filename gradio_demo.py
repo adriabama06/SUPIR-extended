@@ -1,9 +1,12 @@
+
+
 import argparse
 import base64
 import datetime
 import gc
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -20,11 +23,14 @@ import gradio as gr
 import numpy as np
 import requests
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
 from PIL import PngImagePlugin
 from gradio_imageslider import ImageSlider
 import pillow_avif  # Import the AVIF plugin
 from PIL import UnidentifiedImageError
+
+# Enable loading of truncated images automatically
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 import ui_helpers
 from SUPIR.models.SUPIR_model import SUPIRModel
@@ -297,6 +303,8 @@ parser.add_argument("--ckpt", type=str, default='Juggernaut-XL_v9_RunDiffusionPh
 parser.add_argument("--ckpt_browser", action='store_true', default=True, help="Enable a checkpoint selection dropdown.")
 parser.add_argument("--ckpt_dir", type=str, default='models/checkpoints',
                     help="Directory where model checkpoints are stored.")
+parser.add_argument("--lora_dir", type=str, default='models/Lora',
+                    help="Directory where LoRA files are stored.")
 parser.add_argument("--theme", type=str, default='default',
                     help="Theme for the UI. Use 'default' or specify a custom theme.")
 parser.add_argument("--open_browser", action='store_true', default=True,
@@ -399,6 +407,34 @@ def safe_open_image(image_path):
         print(f"Error opening image: {str(e)}")
         raise
 
+def sanitize_filename_part(text):
+    """Sanitize a string to be safe for use in filenames."""
+    if not text:
+        return ""
+    
+    # Characters that are invalid in Windows filenames
+    invalid_chars = '<>:"/\\|?*'
+    # Additional problematic characters
+    invalid_chars += '\x00\r\n\t'
+    
+    # Replace invalid characters with underscore
+    sanitized = text
+    for char in invalid_chars:
+        sanitized = sanitized.replace(char, '_')
+    
+    # Remove control characters (0-31) and DEL (127)
+    sanitized = ''.join(char if ord(char) > 31 and ord(char) != 127 else '_' for char in sanitized)
+    
+    # Remove leading/trailing spaces and dots (Windows doesn't like them)
+    sanitized = sanitized.strip(' .')
+    
+    # Limit length to prevent issues (keep it reasonable for prefix/suffix)
+    max_length = 50
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length]
+    
+    return sanitized
+
 def apply_metadata(image_path):
     global elements_dict, extra_info_elements
     
@@ -499,10 +535,19 @@ server_ip = args.ip
 if args.debug:
     args.open_browser = False
 
-if args.ckpt_dir == "models/checkpoints":
+# Normalize checkpoint directory path
+if not os.path.isabs(args.ckpt_dir):
     args.ckpt_dir = os.path.join(os.path.dirname(__file__), args.ckpt_dir)
-    if not os.path.exists(args.ckpt_dir):
-        os.makedirs(args.ckpt_dir, exist_ok=True)
+args.ckpt_dir = os.path.abspath(os.path.normpath(args.ckpt_dir))
+if not os.path.exists(args.ckpt_dir):
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+
+# Normalize LoRA directory path
+if not os.path.isabs(args.lora_dir):
+    args.lora_dir = os.path.join(os.path.dirname(__file__), args.lora_dir)
+args.lora_dir = os.path.abspath(os.path.normpath(args.lora_dir))
+if not os.path.exists(args.lora_dir):
+    os.makedirs(args.lora_dir, exist_ok=True)
 
 if torch.cuda.device_count() >= 2:
     SUPIR_device = 'cuda:0'
@@ -525,9 +570,192 @@ status_container = StatusContainer()
 elements_dict = {}
 extra_info_elements = {}
 
+# Force initialization of processing state
 single_process = False
 is_processing = False
 last_used_checkpoint = None
+
+# Initialize batch processing variables to ensure clean state
+batch_start_time = None
+batch_total_count = 0
+batch_processed_count = 0
+batch_processing_times = []
+batch_current_stage = ""
+batch_current_image_name = ""
+
+
+print(f"App startup: is_processing = {is_processing}")
+
+
+def get_progress_display_html(title, content):
+    """Generate HTML structure for progress display"""
+    return f"""
+    <div style="
+        position: fixed !important;
+        top: 20px !important;
+        left: 20px !important;
+        width: 45vw !important;
+        max-width: 600px !important;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important; 
+        color: white !important; 
+        padding: 8px 12px !important; 
+        border-radius: 12px !important; 
+        font-family: 'Segoe UI', Arial, sans-serif !important; 
+        box-shadow: 0 8px 32px rgba(0,0,0,0.8) !important;
+        border: 3px solid #4299e1 !important;
+        z-index: 9999999 !important;
+        pointer-events: none !important;
+    ">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <h2 style="margin: 0; font-size: 16px; font-weight: 700; color: #ffffff; text-shadow: 0 2px 4px rgba(0,0,0,0.3);">
+                {title}
+            </h2>
+        </div>
+        {content}
+    </div>
+    """
+
+def get_batch_progress_html():
+    """Generate HTML for persistent batch progress display"""
+    global batch_start_time, batch_processed_count, batch_total_count, batch_processing_times, batch_current_stage, batch_current_image_name
+    
+    if not is_processing or batch_total_count == 0:
+        return ""
+    
+    # Calculate metrics
+    remaining = batch_total_count - batch_processed_count
+    
+    # Calculate average processing time and ETA
+    avg_time = 0
+    eta_text = "Calculating..."
+    if len(batch_processing_times) > 0:
+        avg_time = sum(batch_processing_times) / len(batch_processing_times)
+        if remaining > 0:
+            eta_seconds = remaining * avg_time
+            eta_minutes = int(eta_seconds // 60)
+            eta_secs = int(eta_seconds % 60)
+            eta_text = f"{eta_minutes}m {eta_secs}s"
+        else:
+            eta_text = "Complete"
+    
+    # Calculate elapsed time
+    elapsed = "0m 0s"
+    if batch_start_time:
+        elapsed_seconds = time.time() - batch_start_time
+        elapsed_minutes = int(elapsed_seconds // 60)
+        elapsed_secs = int(elapsed_seconds % 60)
+        elapsed = f"{elapsed_minutes}m {elapsed_secs}s"
+    
+    # Progress percentage
+    progress_percent = (batch_processed_count / batch_total_count * 100) if batch_total_count > 0 else 0
+    
+    # Build progress content
+    progress_counter = f"""
+        <div style="background: rgba(255,255,255,0.25); color: white; padding: 8px 16px; border-radius: 20px; font-size: 14px; font-weight: bold; backdrop-filter: blur(10px);">
+            {batch_processed_count}/{batch_total_count} ({progress_percent:.1f}%)
+        </div>
+    """
+    
+    progress_content = f"""
+        <div style="display: flex; justify-content: flex-end; margin-bottom: 8px;">
+            {progress_counter}
+        </div>
+        
+        <div style="background: rgba(255,255,255,0.2); border-radius: 10px; height: 10px; margin-bottom: 8px; overflow: hidden; box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);">
+            <div style="background: linear-gradient(90deg, #4CAF50, #8BC34A, #CDDC39); height: 100%; width: {progress_percent}%; border-radius: 10px; transition: width 0.5s ease; box-shadow: 0 2px 8px rgba(76,175,80,0.4);"></div>
+        </div>
+        
+        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 6px;">
+            <div style="text-align: center; background: rgba(255,255,255,0.1); padding: 6px; border-radius: 6px; backdrop-filter: blur(5px);">
+                <div style="font-size: 14px; font-weight: bold; color: #4CAF50;">⏱️ {avg_time:.1f}s</div>
+                <div style="font-size: 9px; opacity: 0.9;">Avg per Image</div>
+            </div>
+            <div style="text-align: center; background: rgba(255,255,255,0.1); padding: 6px; border-radius: 6px; backdrop-filter: blur(5px);">
+                <div style="font-size: 14px; font-weight: bold; color: #FF9800;">🔄 {remaining}</div>
+                <div style="font-size: 9px; opacity: 0.9;">Remaining</div>
+            </div>
+            <div style="text-align: center; background: rgba(255,255,255,0.1); padding: 6px; border-radius: 6px; backdrop-filter: blur(5px);">
+                <div style="font-size: 14px; font-weight: bold; color: #E91E63;">⏰ {eta_text}</div>
+                <div style="font-size: 9px; opacity: 0.9;">ETA</div>
+            </div>
+            <div style="text-align: center; background: rgba(255,255,255,0.1); padding: 6px; border-radius: 6px; backdrop-filter: blur(5px);">
+                <div style="font-size: 14px; font-weight: bold; color: #2196F3;">📊 {elapsed}</div>
+                <div style="font-size: 9px; opacity: 0.9;">Elapsed</div>
+            </div>
+        </div>
+        
+        <div style="text-align: center; font-size: 10px; color: rgba(255,255,255,0.8); font-style: italic; background: rgba(0,0,0,0.2); padding: 4px; border-radius: 4px;">
+            {batch_current_stage}
+        </div>
+        {f'<div style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.9); margin-top: 4px; background: rgba(76,175,80,0.2); padding: 4px; border-radius: 4px; font-weight: bold;">📄 {batch_current_image_name}</div>' if batch_current_image_name else ''}
+    """
+    
+    html = get_progress_display_html("🚀 BATCH PROCESSING", progress_content)
+    
+    return html
+
+def show_batch_progress():
+    """Function to show/update batch progress display"""
+    if is_processing and batch_total_count > 0:
+        html = get_batch_progress_html()
+        return gr.update(visible=True, value=html)
+    else:
+        return gr.update(visible=False, value="")
+
+def hide_batch_progress():
+    """Function to hide batch progress display"""
+    return gr.update(visible=False, value="")
+
+def clear_output_message():
+    """Simple function to clear any previous output message"""
+    return "", hide_batch_progress()
+
+
+def show_single_progress():
+    """Function to show single image processing status"""
+    if is_processing:
+        single_content = """
+            <div style="text-align: center; font-size: 12px; color: rgba(255,255,255,0.9); font-style: italic; background: rgba(0,0,0,0.2); padding: 8px; border-radius: 4px;">
+                🖼️ Processing single image...
+            </div>
+        """
+        html = get_progress_display_html("⚡ SINGLE PROCESSING", single_content)
+        return gr.update(visible=True, value=html)
+    else:
+        return gr.update(visible=False, value="")
+
+def start_batch_with_progress(*element_values):
+    """Start batch processing and show progress display"""
+    # Show initial batch progress
+    initial_content = """
+        <div style="display: flex; justify-content: flex-end; margin-bottom: 8px;">
+            <div style="background: rgba(255,255,255,0.25); color: white; padding: 8px 16px; border-radius: 20px; font-size: 14px; font-weight: bold; backdrop-filter: blur(10px);">
+                0%
+            </div>
+        </div>
+        
+        <div style="background: rgba(255,255,255,0.2); border-radius: 10px; height: 10px; margin-bottom: 8px; overflow: hidden; box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);">
+            <div style="background: linear-gradient(90deg, #4CAF50, #8BC34A, #CDDC39); height: 100%; width: 0%; border-radius: 10px; transition: width 0.5s ease; box-shadow: 0 2px 8px rgba(76,175,80,0.4);"></div>
+        </div>
+        
+        <div style="text-align: center; font-size: 12px; color: rgba(255,255,255,0.9); font-style: italic; background: rgba(0,0,0,0.2); padding: 8px; border-radius: 4px;">
+            🔄 Initializing batch processing...
+        </div>
+    """
+    initial_html = get_progress_display_html("🚀 BATCH STARTING...", initial_content)
+    
+    # Start the actual batch processing
+    result = start_batch_process(*element_values)
+    
+    # Return result and show progress display
+    return result, gr.update(visible=True, value=initial_html)
+
+def stop_batch_with_progress(progress=gr.Progress()):
+    """Stop batch processing and hide progress display"""
+    result = stop_batch_upscale(progress)
+    return result, gr.update(visible=False, value="")
+
+
 
 slider_html = """
 <div id="keyframeSlider" class="keyframe-slider">
@@ -613,11 +841,6 @@ def list_models():
     if os.path.exists(model_dir):
         output = [os.path.join(model_dir, f) for f in os.listdir(model_dir) if
                   f.endswith('.safetensors') or f.endswith('.ckpt')]
-    else:
-        local_model_dir = os.path.join(os.path.dirname(__file__), args.ckpt_dir)
-        if os.path.exists(local_model_dir):
-            output = [os.path.join(local_model_dir, f) for f in os.listdir(local_model_dir) if
-                      f.endswith('.safetensors') or f.endswith('.ckpt')]
     if os.path.exists(args.ckpt) and args.ckpt not in output:
         output.append(args.ckpt)
     else:
@@ -635,11 +858,9 @@ def get_ckpt_path(ckpt_path):
     if os.path.exists(ckpt_path):
         return ckpt_path
     else:
-        if os.path.exists(args.ckpt_dir):
-            return os.path.join(args.ckpt_dir, ckpt_path)
-        local_model_dir = os.path.join(os.path.dirname(__file__), args.ckpt_dir)
-        if os.path.exists(local_model_dir):
-            return os.path.join(local_model_dir, ckpt_path)
+        full_path = os.path.join(args.ckpt_dir, ckpt_path)
+        if os.path.exists(full_path):
+            return full_path
     return None
 
 
@@ -690,6 +911,29 @@ def selected_model():
     return None
 
 
+def list_loras():
+    """List all LoRA files in the specified LoRA directory."""
+    output = ["None"]  # Add None as the first option
+
+    if os.path.exists(args.lora_dir):
+        lora_files = [f for f in os.listdir(args.lora_dir) if f.endswith('.safetensors') or f.endswith('.ckpt')]
+        output.extend(sorted(lora_files))
+
+    return output
+
+
+def get_lora_path(lora_filename):
+    """Get the full path to a LoRA file."""
+    if lora_filename == "None" or not lora_filename:
+        return None
+
+    lora_path = os.path.join(args.lora_dir, lora_filename)
+    if os.path.exists(lora_path):
+        return lora_path
+
+    return None
+
+
 def load_face_helper():
     global face_helper
     if face_helper is None:
@@ -702,38 +946,103 @@ def load_face_helper():
         )
 
 
-def load_model(selected_model, selected_checkpoint, weight_dtype, sampler='DPMPP2M', device='cpu', progress=gr.Progress()):
-    global model, last_used_checkpoint
+def load_model(selected_model, selected_checkpoint, weight_dtype, sampler='DPMPP2M', device='cpu',
+               lora_configs=None, cache_base_model=False, progress=gr.Progress()):
+    global model, last_used_checkpoint, last_used_loras
+
+    # Initialize cache attributes if they don't exist
+    if not hasattr(load_model, 'cached_base_state'):
+        load_model.cached_base_state = None
+        load_model.cached_checkpoint = None
+        load_model.cached_model_type = None
 
     # Determine the need for model loading or updating
     need_to_load_model = last_used_checkpoint is None or last_used_checkpoint != selected_checkpoint
     need_to_update_model = selected_model != (model.current_model if model else None)
-    if need_to_update_model:
+
+    # Check if LoRA configuration has changed
+    loras_changed = False
+    if hasattr(load_model, 'last_used_loras'):
+        loras_changed = load_model.last_used_loras != lora_configs
+    else:
+        load_model.last_used_loras = None
+
+    # Check if we can use cached base model
+    can_use_cache = (
+        cache_base_model and
+        load_model.cached_base_state is not None and
+        load_model.cached_checkpoint == selected_checkpoint and
+        load_model.cached_model_type == selected_model and
+        not need_to_update_model and
+        not need_to_load_model
+    )
+
+    if can_use_cache and loras_changed and model is not None:
+        # Fast LoRA switch - restore base weights and apply new LoRAs
+        printt("Fast LoRA switch: Restoring base model from cache and applying new LoRAs")
+
+        # Restore base model weights from cache
+        for name, param in model.model.named_parameters():
+            if name in load_model.cached_base_state:
+                param.data = load_model.cached_base_state[name].clone()
+
+        # Apply new LoRAs if any
+        if lora_configs:
+            from SUPIR.util import apply_multiple_loras
+            apply_multiple_loras(model, lora_configs)
+
+        load_model.last_used_loras = lora_configs
+        printt(f"Fast LoRA switch completed - applied {len(lora_configs) if lora_configs else 0} LoRA(s)")
+        return  # Skip full model reload
+
+    if need_to_update_model or (loras_changed and not can_use_cache):
         del model
         model = None
+        # Clear cache if model type changes
+        if need_to_update_model:
+            load_model.cached_base_state = None
+            load_model.cached_checkpoint = None
+            load_model.cached_model_type = None
 
     # Resolve checkpoint path
     checkpoint_paths = [
         selected_checkpoint,
-        os.path.join(args.ckpt_dir, selected_checkpoint),
-        os.path.join(os.path.dirname(__file__), args.ckpt_dir, selected_checkpoint)
+        os.path.join(args.ckpt_dir, selected_checkpoint)
     ]
     checkpoint_use = next((path for path in checkpoint_paths if os.path.exists(path)), None)
     if checkpoint_use is None:
         raise FileNotFoundError(f"Checkpoint {selected_checkpoint} not found.")
 
     # Check if we need to load a new model
-    if need_to_load_model or model is None:
+    if need_to_load_model or model is None or loras_changed:
         torch.cuda.empty_cache()
         last_used_checkpoint = checkpoint_use
+        load_model.last_used_loras = lora_configs
         model_cfg = "options/SUPIR_v0_tiled.yaml" if args.use_tile_vae else "options/SUPIR_v0.yaml"
         weight_dtype = 'fp16' if not bf16_supported else weight_dtype
         model = create_SUPIR_model(model_cfg, weight_dtype, supir_sign=selected_model[-1], device=device, ckpt=checkpoint_use,
-                                   sampler=sampler)
+                                   sampler=sampler, lora_configs=lora_configs)
         model.current_model = selected_model
-     
+
         if args.use_tile_vae:
             model.init_tile_vae(encoder_tile_size=512, decoder_tile_size=64, use_fast=args.use_fast_tile)
+
+        # Cache the base model if requested
+        if cache_base_model and not lora_configs:
+            printt("Caching base model weights for fast LoRA switching...")
+            load_model.cached_base_state = {}
+            for name, param in model.model.named_parameters():
+                # Only cache layers that LoRAs typically modify
+                if any(key in name for key in ['attn', 'to_k', 'to_v', 'to_q', 'to_out', 'proj', 'mlp']):
+                    load_model.cached_base_state[name] = param.data.clone()
+
+            load_model.cached_checkpoint = selected_checkpoint
+            load_model.cached_model_type = selected_model
+            printt(f"Cached {len(load_model.cached_base_state)} layer weights for fast switching")
+        elif cache_base_model and lora_configs:
+            # Cache base model BEFORE applying LoRAs
+            printt("Note: Base model will be cached on next run without LoRAs")
+
         if progress is not None:
             progress(1, desc="SUPIR loaded.")
 
@@ -1225,10 +1534,15 @@ def populate_gallery():
                                                                         elem_classes=["preview_slider", "preview_box"])
 
 
-def start_single_process(*element_values):
-    global status_container, is_processing
-    # Ensure we start with a clean processing state
+def start_single_process(*element_values, progress=gr.Progress()):
+    global status_container, is_processing, batch_total_count, batch_processed_count, batch_processing_times, batch_current_stage
+    
+    # Force reset processing state to handle any stuck flags
     is_processing = False
+    batch_total_count = 0
+    batch_processed_count = 0
+    batch_processing_times = []
+    batch_current_stage = ""
     status_container = StatusContainer()
     values_dict = zip(elements_dict.keys(), element_values)
     values_dict = dict(values_dict)
@@ -1237,12 +1551,21 @@ def start_single_process(*element_values):
     status_container.process_params = status_container.process_params or {}
     status_container.process_params['ckpt_type'] = ckpt_type.value
     
-    img_data = []
-    validate_upscale = float(values_dict.get('upscale', 1)) > 1 or values_dict.get('apply_face', False) or values_dict.get('apply_bg', False)
-
+    # Check if auto_unload_models is enabled
+    auto_unload_models = values_dict.get('auto_unload_models', False)
+    
     input_image = values_dict['src_file']
     if input_image is None:
-        return "No input image provided."
+        return "No input image provided.", hide_batch_progress()
+    
+    # If auto_unload_models is enabled, use subprocess mode
+    if auto_unload_models:
+        # Subprocess mode - run in separate process for full memory cleanup
+        return run_single_in_subprocess(values_dict, progress)
+    
+    # Standard in-process mode below
+    img_data = []
+    validate_upscale = float(values_dict.get('upscale', 1)) > 1 or values_dict.get('apply_face', False) or values_dict.get('apply_bg', False) or values_dict.get('apply_face_only', False)
 
     image_files = [input_image]
 
@@ -1278,25 +1601,55 @@ def start_single_process(*element_values):
     # auto_unload_llava, batch_process_folder, main_prompt, output_video_format, output_video_quality, outputs_folder,video_duration, video_fps, video_height, video_width
     keys_to_pop = ['batch_process_folder', 'main_prompt', 'output_video_format',
                    'output_video_quality', 'outputs_folder', 'video_duration', 'video_end', 'video_fps',
-                   'video_height', 'video_start', 'video_width', 'src_file', 'ckpt_type']
+                   'video_height', 'video_start', 'video_width', 'src_file', 'ckpt_type', 'auto_unload_models']
 
     values_dict['outputs_folder'] = args.outputs_folder
     status_container.process_params = values_dict
     values_dict = {k: v for k, v in values_dict.items() if k not in keys_to_pop}
 
     try:
-        _, result = batch_process(img_data, **values_dict)
+        is_processing = True
+        # Show single processing status
+        single_progress_display = show_single_progress()
+        
+        # IMPORTANT: Return immediately with a starting message to clear previous completion messages
+        # This creates immediate UI feedback when the button is clicked
+        starting_result = "Processing started..."
+        # Note: This will be overridden by the actual result when batch_process completes
+        
+        # Override skip_existing_images to False for single image processing
+        # Users expect single images to always be processed
+        values_dict['skip_existing_images'] = False
+        _, result = batch_process(img_data, **values_dict, progress=progress)
+        
+        is_processing = False
     except Exception as e:
         print(f"An exception occurred: {e} at {traceback.format_exc()}")
         is_processing = False
-    return result
+    
+    # Return result and hidden batch progress display for single processing  
+    batch_progress_display = hide_batch_progress()
+    return result, batch_progress_display
 
 
-def start_batch_process(*element_values):
-    global status_container, is_processing
-    # Ensure we start with a clean processing state
+
+def start_batch_process(*element_values, progress=gr.Progress()):
+    global status_container, is_processing, batch_start_time, batch_processed_count, batch_total_count, batch_processing_times, batch_current_stage
+    
+    # Force reset processing state to handle any stuck flags
     is_processing = False
+    batch_total_count = 0
+    batch_processed_count = 0
+    batch_processing_times = []
+    batch_current_stage = ""
     status_container = StatusContainer()
+    
+    # Initialize batch progress tracking
+    batch_start_time = None
+    batch_processed_count = 0
+    batch_total_count = 0
+    batch_processing_times = []
+    batch_current_stage = "Initializing..."
     values_dict = zip(elements_dict.keys(), element_values)
     values_dict = dict(values_dict)
     
@@ -1304,45 +1657,64 @@ def start_batch_process(*element_values):
     status_container.process_params = status_container.process_params or {}
     status_container.process_params['ckpt_type'] = ckpt_type.value
     
+    # Check if auto_unload_models is enabled
+    auto_unload_models = values_dict.get('auto_unload_models', False)
+    
     batch_folder = values_dict.get('batch_process_folder')
     if not batch_folder:
-        return "No input folder provided."
+        return "No input folder provided.", hide_batch_progress()
     if not os.path.exists(batch_folder):
-        return "The input folder does not exist."
+        return "The input folder does not exist.", hide_batch_progress()
 
-    if len(values_dict['outputs_folder']) < 2:
+    if len(values_dict.get('outputs_folder', '')) < 2:
         values_dict['outputs_folder'] = args.outputs_folder
 
-    image_files = [file for file in os.listdir(batch_folder) if
+    image_files = [os.path.join(batch_folder, file) for file in os.listdir(batch_folder) if
                    is_image(os.path.join(batch_folder, file))]
+    
+    if not image_files:
+        return "No images found in the input folder.", hide_batch_progress()
+    
+    # If auto_unload_models is enabled, use subprocess mode
+    if auto_unload_models:
+        return run_batch_in_subprocess(values_dict, image_files, progress)
 
+    # Standard in-process mode below
     # Make a dictionary to store the image data and path
     img_data = []
-    for file in image_files:
-        media_data = MediaData(media_path=os.path.join(batch_folder, file))
-        img = safe_open_image(os.path.join(batch_folder, file))
+    for file_path in image_files:
+        media_data = MediaData(media_path=file_path)
+        img = safe_open_image(file_path)
         media_data.media_data = np.array(img)
         media_data.caption = values_dict['main_prompt']
         img_data.append(media_data)
 
     # Store it globally
     status_container.image_data = img_data
+    
+    # Set total count for batch progress tracking
+    batch_total_count = len(img_data)
+    
     result = "An exception occurred. Please try again."
     try:
         keys_to_pop = ['batch_process_folder', 'main_prompt', 'output_video_format',
                        'output_video_quality', 'outputs_folder', 'video_duration', 'video_end', 'video_fps',
-                       'video_height', 'video_start', 'video_width', 'src_file', 'ckpt_type']
+                       'video_height', 'video_start', 'video_width', 'src_file', 'ckpt_type', 'auto_unload_models']
 
         status_container.outputs_folder = values_dict['outputs_folder']
         values_dict['outputs_folder'] = values_dict['outputs_folder']
         status_container.process_params = values_dict
 
         values_dict = {k: v for k, v in values_dict.items() if k not in keys_to_pop}
-        result, _ = batch_process(img_data, **values_dict)
+        result, _ = batch_process(img_data, **values_dict, progress=progress)
     except Exception as e:
         print(f"An exception occurred: {e} at {traceback.format_exc()}")
         is_processing = False
-    return result
+    
+    # Return both result status and batch progress display
+    batch_progress_display = show_batch_progress()
+    return result, batch_progress_display
+
 
 
 def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions=False, progress=gr.Progress(), skip_llava_if_txt_exists: bool = True):
@@ -1371,10 +1743,12 @@ def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions
             md.caption = caption
             outputs.append(md)
             step += 1
-            progress(step / total_steps, desc=f"Skipped LLaVA for image {step}/{len(inputs)}, using existing text file")
+            batch_info = f" [BATCH: {batch_processed_count}/{batch_total_count}]" if batch_total_count > 0 else ""
+            progress(step / total_steps, desc=f"Skipped LLaVA for image {step}/{len(inputs)}, using existing text file{batch_info}")
             continue
             
-        progress(step / total_steps, desc=f"Processing image {step}/{len(inputs)} with LLaVA...")
+        batch_info = f" [BATCH: {batch_processed_count}/{batch_total_count}]" if batch_total_count > 0 else ""
+        progress(step / total_steps, desc=f"Processing image {step}/{len(inputs)} with LLaVA...{batch_info}")
         if img is None:  ## this is for llava and video
             img = safe_open_image(img_path)
             img = np.array(img)
@@ -1386,7 +1760,7 @@ def llava_process(inputs: List[MediaData], temp, p, question=None, save_captions
         outputs.append(md)
         if save_captions:
             cap_path = os.path.splitext(img_path)[0] + ".txt"
-            with open(cap_path, 'w') as cf:
+            with open(cap_path, 'w', encoding='utf-8') as cf:
                 cf.write(caption)
         if not is_processing:  # Check if batch processing has been stopped
             break
@@ -1499,9 +1873,12 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                   s_stage1, s_stage2, s_cfg, seed, sampler, s_churn, s_noise, color_fix_type, diff_dtype, ae_dtype,
                   linear_cfg, linear_s_stage2, spt_linear_cfg, spt_linear_s_stage2, model_select,
                   ckpt_select, num_images, random_seed, apply_llava, face_resolution, apply_bg, apply_face,
-                  face_prompt, max_megapixels, max_resolution, dont_update_progress=False, unload=True,
+                  face_prompt, max_megapixels, max_resolution, first_downscale,
+                  lora_1=None, lora_1_weight=1.0, lora_2=None, lora_2_weight=1.0,
+                  lora_3=None, lora_3_weight=1.0, lora_4=None, lora_4_weight=1.0,
+                  cache_base_model=False, apply_face_only=False, dont_update_progress=False, unload=True,
                   progress=gr.Progress()):
-    global model, status_container, event_id
+    global model, status_container, event_id, batch_processed_count, batch_processing_times, batch_current_stage, batch_total_count, batch_start_time, batch_current_image_name
     main_begin_time = time.time()
     
     # Ensure all parameters are of the correct type
@@ -1525,10 +1902,14 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
             apply_bg = apply_bg.lower() == 'true'
         if isinstance(apply_face, str):
             apply_face = apply_face.lower() == 'true'
+        if isinstance(apply_face_only, str):
+            apply_face_only = apply_face_only.lower() == 'true'
         if isinstance(linear_cfg, str):
             linear_cfg = linear_cfg.lower() == 'true'
         if isinstance(linear_s_stage2, str):
             linear_s_stage2 = linear_s_stage2.lower() == 'true'
+        if isinstance(first_downscale, str):
+            first_downscale = first_downscale.lower() == 'true'
     except (ValueError, TypeError) as e:
         print(f"Error converting parameters: {e}")
         # Provide default values in case of conversion errors
@@ -1540,12 +1921,26 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
     if unload:
         total_progress += 1
     counter = 0
-    progress(counter / total_progress, desc="Loading SUPIR Model...")
-    load_model(model_select, ckpt_select, diff_dtype, sampler, progress=progress)
+    # Prepare LoRA configurations
+    lora_configs = []
+    for i in range(1, 5):
+        lora_name = locals().get(f'lora_{i}')
+        lora_weight = locals().get(f'lora_{i}_weight', 1.0)
+        if lora_name and lora_name != "None":
+            lora_path = get_lora_path(lora_name)
+            if lora_path:
+                lora_configs.append((lora_path, lora_weight))
+
+    batch_info = f" [BATCH: {batch_processed_count}/{batch_total_count} images queued]" if batch_total_count > 0 else ""
+    progress(counter / total_progress, desc=f"Loading SUPIR Model...{batch_info}")
+    load_model(model_select, ckpt_select, diff_dtype, sampler, device=SUPIR_device,
+               lora_configs=lora_configs if lora_configs else None,
+               cache_base_model=cache_base_model, progress=progress)
     to_gpu(model, SUPIR_device)
 
     counter += 1
-    progress(counter / total_progress, desc="Model Loaded, Processing Images...")
+    batch_info = f" [BATCH: {batch_processed_count}/{batch_total_count} images ready]" if batch_total_count > 0 else ""
+    progress(counter / total_progress, desc=f"Model Loaded, Processing Images...{batch_info}")
     model.ae_dtype = convert_dtype('fp32' if bf16_supported == False else ae_dtype)
     model.model.dtype = convert_dtype('fp16' if bf16_supported == False else diff_dtype)
 
@@ -1559,11 +1954,38 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
     params = status_container.process_params
 
     for image_data in inputs:
+        # Track processing time for this image
+        image_start_time = time.time()
+        
         gen_params_list = []
         img_params = params.copy()
         img = image_data.media_data
         image_path = image_data.media_path
-        progress(counter / total_progress, desc=f"Processing image {counter}/{total_images}...")
+        
+        # Update batch progress
+        batch_current_stage = f"Processing image {batch_processed_count + 1}/{batch_total_count}"
+        # Extract and update current image name
+        image_name = os.path.basename(image_path) if image_path else "Unknown"
+        batch_current_image_name = image_name
+        
+        # Show batch metrics in the progress description where it's always visible
+        batch_info = ""
+        if batch_total_count > 0:
+            if len(batch_processing_times) > 0:
+                avg_time = sum(batch_processing_times) / len(batch_processing_times)
+                remaining = batch_total_count - batch_processed_count
+                elapsed_time = time.time() - batch_start_time if batch_start_time else 0
+                elapsed_mins = int(elapsed_time // 60)
+                if remaining > 0:
+                    eta_seconds = remaining * avg_time
+                    eta_minutes = int(eta_seconds // 60)
+                    batch_info = f" 🚀 BATCH: {batch_processed_count + 1}/{batch_total_count} | {remaining} left | Avg: {avg_time:.1f}s | ETA: {eta_minutes}m | Elapsed: {elapsed_mins}m"
+                else:
+                    batch_info = f" 🚀 BATCH: {batch_processed_count + 1}/{batch_total_count} | Almost done! | Elapsed: {elapsed_mins}m"
+            else:
+                batch_info = f" 🚀 BATCH: {batch_processed_count + 1}/{batch_total_count} | Starting..."
+        
+        progress(counter / total_progress, desc=f"Processing image {counter}/{total_images}...{batch_info}")
         if img is None:
             printt(f"Image {counter}/{total_images} is None, loading from disk.")
             with safe_open_image(image_path) as img:
@@ -1617,6 +2039,28 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
         
         # Calculate final upscale factor
         final_upscale = min(target_h / h, target_w / w)
+        
+        # Apply first downscale logic if enabled
+        if first_downscale:
+            # Calculate the target resolution after constraints
+            final_target_h = int(target_h)
+            final_target_w = int(target_w)
+            
+            # First, downscale the image to match the target resolution divided by upscale factor
+            # This ensures that when we upscale by the specified factor, we get the exact target resolution
+            downscale_target_h = int(final_target_h / upscale)
+            downscale_target_w = int(final_target_w / upscale)
+            
+            printt(f"First Downscale enabled: Downscaling to {downscale_target_w}x{downscale_target_h}, then upscaling {upscale}x to {final_target_w}x{final_target_h}")
+            
+            # Use PIL Image for high-quality Lanczos downscaling
+            img_pil = Image.fromarray(img.astype('uint8'))
+            img_pil_downscaled = img_pil.resize((downscale_target_w, downscale_target_h), Image.LANCZOS)
+            img = np.array(img_pil_downscaled)
+            
+            # Now set the final upscale to exactly the specified upscale factor
+            final_upscale = float(upscale)
+        
         printt(f"Final upscale factor: {final_upscale:.2f}")
         
         img = upscale_image(img, final_upscale, unit_resolution=32, min_size=1024)
@@ -1627,17 +2071,22 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
 
         _faces = []
         if not dont_update_progress and progress is not None:
-            progress(counter / total_images, desc=f"Upscaling Images {counter}/{total_images}")
+            progress_value = counter / total_images if total_images > 0 else 1.0
+            progress(progress_value, desc=f"Upscaling Images {counter}/{total_images}")
         face_captions = [img_prompt]
 
-        if apply_face:
+        if apply_face or apply_face_only:
             lq = np.array(img)
             load_face_helper()
             if face_helper is None or not isinstance(face_helper, FaceRestoreHelper):
                 raise ValueError('Face helper not loaded')
             # <<< FIX: Update face_helper's upscale factor >>>
-            printt(f"DEBUG: Setting face_helper upscale_factor to {final_upscale}")
-            face_helper.upscale_factor = final_upscale 
+            if apply_face_only:
+                printt(f"DEBUG: Setting face_helper upscale_factor to 1 for face-only mode")
+                face_helper.upscale_factor = 1
+            else:
+                printt(f"DEBUG: Setting face_helper upscale_factor to {final_upscale}")
+                face_helper.upscale_factor = final_upscale 
             # <<< END FIX >>>
             face_helper.clean_all()
             face_helper.read_image(lq)
@@ -1666,6 +2115,14 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
         for _ in range(num_images):
             gen_params = img_params.copy()
             gen_params['evt_id'] = event_id
+
+            # Add LoRA information to metadata
+            for i in range(1, 5):
+                lora_name = locals().get(f'lora_{i}')
+                lora_weight = locals().get(f'lora_{i}_weight', 1.0)
+                if lora_name and lora_name != "None":
+                    gen_params[f'lora_{i}'] = lora_name
+                    gen_params[f'lora_{i}_weight'] = lora_weight
             result = None
             if random_seed or num_images > 1:
                 seed = np.random.randint(0, 2147483647)
@@ -1703,7 +2160,7 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                               512 - face_resolution // 2:512 + face_resolution // 2]
                 return samples
 
-            if apply_face:
+            if apply_face or apply_face_only:
                 faces = []
                 restored_faces = []
                 for face in face_helper.cropped_faces:
@@ -1764,7 +2221,15 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                     result = _bg[0]
                     printt("DEBUG: Using only restored background. Final image shape: {result.shape if result is not None else 'None'}")
 
-            if not apply_bg and apply_face:                
+            if apply_face_only:
+                printt(f"DEBUG: Applying face-only restoration (no upscaling). Restored faces count: {len(face_helper.restored_faces)}")
+                printt("DEBUG: Using original image resolution (upscale_factor already set to 1).")
+                face_helper.get_inverse_affine(None)
+                printt(f"DEBUG: Pasting {len(face_helper.restored_faces)} faces onto original image. Shape: {face_helper.input_img.shape if hasattr(face_helper, 'input_img') else 'N/A'}")
+                result = face_helper.paste_faces_to_input_image()
+                printt(f"DEBUG: Face-only restoration complete. Final image shape: {result.shape if result is not None else 'None'}")
+                
+            elif not apply_bg and apply_face:                
                 printt(f"DEBUG: Applying only face restoration. Restored faces count: {len(face_helper.restored_faces)}")
                 printt("DEBUG: Getting inverse affine transform before pasting faces onto original sized image.")
                 # <<< FIX: Update face_helper's upscale factor (redundant here if done earlier, but safe) >>>
@@ -1780,7 +2245,7 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
                 result = face_helper.paste_faces_to_input_image()
                 printt(f"DEBUG: Pasting complete (no BG). Final image shape: {result.shape if result is not None else 'None'}")
 
-            if not apply_face and not apply_bg:
+            elif not apply_face and not apply_bg and not apply_face_only:
                 printt("DEBUG: Applying standard SUPIR upscale (no face/BG restoration).")
                 caption = [img_prompt]
                 print("Batchifying sample...")
@@ -1798,9 +2263,34 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
             if result is not None:
                 results.append(result)
                 gen_params_list.append(gen_params)
-            desc = f"Image {counter}/{total_images} upscale completed in {image_generation_time:.2f} seconds"
             counter += 1
-            progress(counter / total_images, desc=desc)
+            
+            # Update batch progress tracking
+            image_total_time = time.time() - image_start_time
+            batch_processing_times.append(image_total_time)
+            batch_processed_count += 1
+            
+            # Add batch info to completion message
+            batch_completion_info = ""
+            if batch_total_count > 0:
+                avg_time = sum(batch_processing_times) / len(batch_processing_times)
+                remaining = batch_total_count - batch_processed_count
+                elapsed_time = time.time() - batch_start_time if batch_start_time else 0
+                elapsed_mins = int(elapsed_time // 60)
+                
+                if remaining > 0:
+                    eta_seconds = remaining * avg_time
+                    eta_minutes = int(eta_seconds // 60)
+                    batch_completion_info = f" 🚀 BATCH: {batch_processed_count}/{batch_total_count} DONE | {remaining} left | Avg: {avg_time:.1f}s | ETA: {eta_minutes}m | Elapsed: {elapsed_mins}m"
+                else:
+                    batch_completion_info = f" 🚀 BATCH COMPLETE! All {batch_processed_count} images processed | Total: {elapsed_mins}m"
+            
+            desc = f"Image {counter}/{total_images} completed{batch_completion_info}"
+            progress_value = counter / total_images if total_images > 0 else 1.0
+            progress(progress_value, desc=desc)
+            
+            # Note: batch_metrics_html will show persistent progress info automatically
+            # The metrics display is updated via the global variables we just modified
 
         # Update outputs
         image_data.outputs = results
@@ -1811,7 +2301,8 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
         # Append the image data to the output data after saving
         output_data.append(image_data)
 
-        progress(counter / total_images, desc=f"Image {counter}/{total_images} processed.")
+        progress_value = counter / total_images if total_images > 0 else 1.0
+        progress(progress_value, desc=f"Image {counter}/{total_images} processed.")
         processed_images = counter
         # Check if cancellation was requested
         if not is_processing:
@@ -1826,9 +2317,10 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
     # Now we update the status container
     status_container.image_data = output_data
     if not is_processing or unload:
-        progress(counter / total_images, desc="Unloading SUPIR...")
+        progress_value = counter / total_images if total_images > 0 else 1.0
+        progress(progress_value, desc="Unloading SUPIR...")
         all_to_cpu()
-        progress(counter / total_images, desc="SUPIR Unloaded.")
+        progress(progress_value, desc="SUPIR Unloaded.")
     main_end_time = time.time()
     global unique_counter
     unique_counter = unique_counter + 1
@@ -1836,13 +2328,21 @@ def supir_process(inputs: List[MediaData], a_prompt, n_prompt, num_samples,
 
 
 def batch_process(img_data,
-                  a_prompt, ae_dtype, apply_bg, apply_face, apply_llava, apply_supir, ckpt_select, color_fix_type,
-                  diff_dtype, edm_steps, face_prompt, face_resolution, linear_CFG, linear_s_stage2,
+                  a_prompt, ae_dtype, apply_bg, apply_face, apply_face_only, apply_llava, apply_supir, cache_base_model, ckpt_select, color_fix_type,
+                  diff_dtype, edm_steps, face_prompt, face_resolution, filename_prefix, filename_suffix, first_downscale, linear_CFG, linear_s_stage2,
+                  lora_1, lora_1_weight, lora_2, lora_2_weight, lora_3, lora_3_weight, lora_4, lora_4_weight,
                   make_comparison_video, model_select, n_prompt, num_images, num_samples, qs, random_seed,
                   s_cfg, s_churn, s_noise, s_stage1, s_stage2, sampler, save_captions, seed, spt_linear_CFG,
-                  spt_linear_s_stage2, temperature, top_p, upscale, max_megapixels, max_resolution, auto_unload_llava, skip_llava_if_txt_exists, progress=gr.Progress()
+                  spt_linear_s_stage2, temperature, top_p, upscale, max_megapixels, max_resolution, auto_unload_llava, skip_llava_if_txt_exists, skip_existing_images, progress=gr.Progress()
                   ):
-    global is_processing, llava_agent, model, status_container
+    global is_processing, llava_agent, model, status_container, batch_total_count, batch_start_time, batch_processed_count, batch_processing_times, batch_current_stage, batch_current_image_name
+    print(f"batch_process called: is_processing = {is_processing}")
+    
+    # Safety check: if is_processing is True but we're being called from a fresh start,
+    # it might be stuck from a previous crash - reset it
+    if is_processing and batch_total_count == 0:
+        print("Detected stuck is_processing flag - resetting")
+        is_processing = False
     
     # Ensure key parameters are of the correct type before processing
     try:
@@ -1864,6 +2364,8 @@ def batch_process(img_data,
             apply_bg = apply_bg.lower() == 'true'
         if isinstance(apply_face, str):
             apply_face = apply_face.lower() == 'true'
+        if isinstance(apply_face_only, str):
+            apply_face_only = apply_face_only.lower() == 'true'
         if isinstance(random_seed, str):
             random_seed = random_seed.lower() == 'true'
         if isinstance(linear_CFG, str):
@@ -1876,6 +2378,10 @@ def batch_process(img_data,
             save_captions = save_captions.lower() == 'true'
         if isinstance(auto_unload_llava, str):
             auto_unload_llava = auto_unload_llava.lower() == 'true'
+        if isinstance(first_downscale, str):
+            first_downscale = first_downscale.lower() == 'true'
+        if isinstance(skip_existing_images, str):
+            skip_existing_images = skip_existing_images.lower() == 'true'
     except (ValueError, TypeError) as e:
         print(f"Error converting parameters in batch_process: {e}")
         # Continue with original values if conversion fails
@@ -1903,6 +2409,13 @@ def batch_process(img_data,
 
     params = status_container.process_params
     is_processing = True
+    
+    # Initialize batch progress tracking
+    batch_start_time = time.time()
+    batch_processed_count = 0
+    batch_total_count = len(img_data)
+    batch_current_stage = "Starting batch processing..."
+    
     # Get the list of image files in the folder
     total_images = len(img_data)
 
@@ -1921,9 +2434,12 @@ def batch_process(img_data,
     # Disable llava for video...because...uh...yeah, video.
     # if status_container.is_video:
     #   apply_llava = False
-    progress(0, desc=f"Processing {total_images} images...")
+    batch_info = f" 🚀 BATCH: {batch_total_count} images queued for processing" if batch_total_count > 0 else ""
+    # Clear any previous completion message by showing current processing status
+    progress(0, desc=f"Starting - Processing {total_images} images...{batch_info}")
     printt(f"Processing {total_images} images...", reset=True)
     if apply_llava:
+        batch_current_stage = "Processing LLaVA (image captioning)..." if os.environ.get("USE_OPENAI", "off") == "off" else "Processing OpenAI (image captioning)..."
         if os.environ.get("USE_OPENAI", "off") == "off":
             printt('Processing LLaVA')
             last_result = llava_process(img_data, temperature, top_p, qs, save_captions, progress=progress, skip_llava_if_txt_exists=skip_llava_if_txt_exists)
@@ -1943,6 +2459,47 @@ def batch_process(img_data,
 
         # Update the img_data from the captioner
         img_data = status_container.image_data
+    
+    # Filter out images that already exist in target folder if skip option is enabled
+    if skip_existing_images and apply_supir:
+        output_dir = params.get('outputs_folder', args.outputs_folder)
+        filtered_img_data = []
+        skipped_count = 0
+        
+        # Get prefix and suffix from params and sanitize them
+        filename_prefix = sanitize_filename_part(params.get('filename_prefix', ''))
+        filename_suffix = sanitize_filename_part(params.get('filename_suffix', ''))
+        
+        for image_data in img_data:
+            image_path = image_data.media_path
+            base_filename = os.path.splitext(os.path.basename(image_path))[0]
+            if len(base_filename) > 250:
+                base_filename = base_filename[:250]
+            
+            # Apply prefix and suffix to the target filename
+            final_filename = f'{filename_prefix}{base_filename}{filename_suffix}'
+            target_path = os.path.join(output_dir, f'{final_filename}.png')
+            
+            # Check if the target file already exists
+            if os.path.exists(target_path):
+                printt(f"Skipping {final_filename}.png - already exists in target folder")
+                skipped_count += 1
+            else:
+                filtered_img_data.append(image_data)
+        
+        img_data = filtered_img_data
+        status_container.image_data = img_data
+        
+        # Recalculate totals after filtering
+        total_images = len(img_data)
+        # Update batch_total_count to reflect the actual number of images to be processed
+        batch_total_count = total_images
+        total_supir_steps = total_images * num_images + 2 if apply_supir else 0
+        total_steps = total_supir_steps + total_llava_steps + 1
+        
+        if skipped_count > 0:
+            printt(f"Skipped {skipped_count} already processed images. Processing {total_images} remaining images.")
+    
     # Check for cancellation
     if not is_processing and model is not None:
         progress(total_steps / total_steps, desc="Cancelling SUPIR...")
@@ -1950,6 +2507,7 @@ def batch_process(img_data,
         return f"Batch Processing Completed: Cancelled at {time.ctime()}.", last_result
     counter += total_llava_steps
     if apply_supir:
+        batch_current_stage = "Processing SUPIR (image upscaling)..."
         progress(counter / total_steps, desc="Processing images...")
         printt("Processing images (Stage 2)")
         # Ensure upscale is a float before passing it to supir_process
@@ -1964,7 +2522,9 @@ def batch_process(img_data,
                                     linear_CFG, linear_s_stage2, spt_linear_CFG, spt_linear_s_stage2, model_select,
                                     ckpt_select,
                                     num_images, random_seed, apply_llava, face_resolution, apply_bg, apply_face,
-                                    face_prompt, max_megapixels, max_resolution, unload=True, progress=progress)
+                                    face_prompt, max_megapixels, max_resolution, first_downscale,
+                                    lora_1, lora_1_weight, lora_2, lora_2_weight, lora_3, lora_3_weight, lora_4, lora_4_weight,
+                                    cache_base_model, apply_face_only, unload=True, progress=progress)
         printt("Processing images (Stage 2) Completed")
     counter += total_supir_steps
     progress(counter / total_steps, desc="Processing completed.")
@@ -1997,7 +2557,15 @@ def batch_process(img_data,
         status_container.image_data = updates
     progress(1, desc="Processing Completed in " + str(time.time() - start_time) + " seconds.")
 
+    # Finalize batch progress tracking
+    batch_current_stage = "Batch processing completed!"
+    
     is_processing = False
+    # Clear batch tracking variables to ensure progress display hides
+    batch_total_count = 0
+    batch_processed_count = 0
+    batch_processing_times = []
+    batch_current_image_name = ""
     end_time = time.time()
     global unique_counter
     unique_counter = unique_counter + 1
@@ -2032,9 +2600,17 @@ def save_image(image_data: MediaData, is_video_frame: bool):
 
         evt_id = event_dict.get('evt_id', str(time.time_ns()))
 
+        # Get the base filename and extension
         base_filename = os.path.splitext(os.path.basename(image_path))[0]
         if len(base_filename) > 250:
             base_filename = base_filename[:250]
+        
+        # Apply prefix and suffix from params and sanitize them
+        filename_prefix = sanitize_filename_part(params.get('filename_prefix', ''))
+        filename_suffix = sanitize_filename_part(params.get('filename_suffix', ''))
+        
+        # Construct the filename with prefix and suffix
+        final_filename = f'{filename_prefix}{base_filename}{filename_suffix}'
 
         img = Image.fromarray(result)
 
@@ -2045,7 +2621,7 @@ def save_image(image_data: MediaData, is_video_frame: bool):
                 f.write(str(event_dict))
             img.save(os.path.join(history_path, f'HQ_{i}.png'))
 
-        save_path = os.path.join(output_dir, f'{base_filename}.png')
+        save_path = os.path.join(output_dir, f'{final_filename}.png')
 
         # If processing video, just save the image
         if is_video_frame:
@@ -2054,7 +2630,7 @@ def save_image(image_data: MediaData, is_video_frame: bool):
         else:
             index = 1
             while os.path.exists(save_path):
-                save_path = os.path.join(output_dir, f'{base_filename}_{str(index).zfill(4)}.png')
+                save_path = os.path.join(output_dir, f'{final_filename}_{str(index).zfill(4)}.png')
                 index += 1
             remove_keys = ["face_gallery"]
             meta = PngImagePlugin.PngInfo()
@@ -2073,12 +2649,12 @@ def save_image(image_data: MediaData, is_video_frame: bool):
                 # This will save the caption to a file with the same name as the image
                 if save_caption:
                     caption_path = f'{os.path.splitext(save_path)[0]}.txt'
-                    with open(caption_path, 'w') as f:
+                    with open(caption_path, 'w', encoding='utf-8') as f:
                         f.write(caption)
             img.save(save_path, "PNG", pnginfo=meta)
 
             metadata_path = os.path.join(metadata_dir, f'{os.path.splitext(os.path.basename(save_path))[0]}.txt')
-            with open(metadata_path, 'w') as f:
+            with open(metadata_path, 'w', encoding='utf-8') as f:
                 for key, value in event_dict.items():
                     try:
                         f.write(f'{key}: {value}\n')
@@ -2098,13 +2674,19 @@ def save_compare_video(image_data: MediaData, params):
         os.makedirs(compare_videos_dir)
 
     base_filename = os.path.splitext(os.path.basename(image_path))[0]
-    save_path = os.path.join(output_dir, f'{base_filename}.mp4')
+    
+    # Apply prefix and suffix from params and sanitize them
+    filename_prefix = sanitize_filename_part(params.get('filename_prefix', ''))
+    filename_suffix = sanitize_filename_part(params.get('filename_suffix', ''))
+    final_filename = f'{filename_prefix}{base_filename}{filename_suffix}'
+    
+    save_path = os.path.join(output_dir, f'{final_filename}.mp4')
     index = 1
     while os.path.exists(save_path):
-        save_path = os.path.join(output_dir, f'{base_filename}_{str(index).zfill(4)}.mp4')
+        save_path = os.path.join(output_dir, f'{final_filename}_{str(index).zfill(4)}.mp4')
         index += 1
 
-    video_path = os.path.join(compare_videos_dir, f'{base_filename}.mp4')
+    video_path = os.path.join(compare_videos_dir, f'{final_filename}.mp4')
     video_path = os.path.abspath(video_path)
     full_save_image_path = os.path.abspath(image_data.outputs[0])
     org_image_absolute_path = os.path.abspath(image_path)
@@ -2118,7 +2700,328 @@ def stop_batch_upscale(progress=gr.Progress()):
     is_processing = False  # Immediately set flag to cancel processing
     progress(1, desc="Cancelling processing... This will take effect immediately.")
     print('\n*** Cancel command received - processing will stop at the next checkpoint ***\n')
-    return "Processing cancelled. Please wait for current operations to stop..."
+    # Hide batch progress when stopping
+    batch_progress_display = hide_batch_progress()
+    return "Processing cancelled. Please wait for current operations to stop...", batch_progress_display
+
+def reset_processing_state():
+    """Reset processing state in case it gets stuck"""
+    global is_processing, batch_total_count, batch_processed_count, batch_processing_times, batch_current_stage, batch_start_time
+    is_processing = False
+    batch_total_count = 0
+    batch_processed_count = 0
+    batch_processing_times = []
+    batch_current_stage = ""
+    batch_start_time = None
+    print("Processing state has been reset.")
+    batch_progress_display = hide_batch_progress()
+    return "Processing state reset successfully.", batch_progress_display
+
+
+# ============================================================================
+# SUBPROCESS PROCESSING FUNCTIONS (Auto Unload Models feature)
+# ============================================================================
+
+def get_subprocess_temp_dir():
+    """Get or create a temporary directory for subprocess files."""
+    temp_dir = os.path.join(tempfile.gettempdir(), 'supir_subprocess')
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
+
+def cleanup_subprocess_files(params_file, progress_file, results_file):
+    """Clean up temporary subprocess files."""
+    for f in [params_file, progress_file, results_file]:
+        try:
+            if f and os.path.exists(f):
+                os.remove(f)
+            # Also remove .tmp files
+            tmp_file = f + ".tmp" if f else None
+            if tmp_file and os.path.exists(tmp_file):
+                os.remove(tmp_file)
+        except Exception as e:
+            print(f"Warning: Could not remove temp file {f}: {e}")
+
+
+def read_subprocess_progress(progress_file):
+    """Read progress from subprocess progress file."""
+    try:
+        if os.path.exists(progress_file):
+            with open(progress_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        pass
+    return None
+
+
+def read_subprocess_results(results_file):
+    """Read results from subprocess results file."""
+    try:
+        if os.path.exists(results_file):
+            with open(results_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Error reading results file: {e}")
+    return None
+
+
+def launch_subprocess_processing(params_dict, progress=None):
+    """
+    Launch processing in a subprocess for automatic memory cleanup.
+    
+    This function:
+    1. Saves parameters to a temp file
+    2. Launches subprocess_worker.py
+    3. Polls for progress updates
+    4. Returns results when complete
+    """
+    global is_processing, batch_total_count, batch_processed_count, batch_processing_times
+    global batch_current_stage, batch_start_time, batch_current_image_name
+    
+    temp_dir = get_subprocess_temp_dir()
+    timestamp = str(int(time.time() * 1000))
+    
+    params_file = os.path.join(temp_dir, f'params_{timestamp}.json')
+    progress_file = os.path.join(temp_dir, f'progress_{timestamp}.json')
+    results_file = os.path.join(temp_dir, f'results_{timestamp}.json')
+    
+    try:
+        # Save parameters to file
+        with open(params_file, 'w', encoding='utf-8') as f:
+            json.dump(params_dict, f)
+        
+        # Get the path to the subprocess worker script
+        worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'subprocess_worker.py')
+        
+        if not os.path.exists(worker_script):
+            return False, "Subprocess worker script not found. Please ensure subprocess_worker.py exists."
+        
+        # Build the command
+        python_exe = sys.executable
+        cmd = [
+            python_exe,
+            worker_script,
+            '--params', params_file,
+            '--progress', progress_file,
+            '--results', results_file
+        ]
+        
+        print(f"Launching subprocess: {' '.join(cmd)}")
+        
+        # Initialize batch tracking
+        batch_start_time = time.time()
+        batch_total_count = len(params_dict.get('image_paths', []))
+        batch_processed_count = 0
+        batch_processing_times = []
+        batch_current_stage = "Starting subprocess..."
+        is_processing = True
+        
+        # Launch subprocess
+        # Use CREATE_NO_WINDOW on Windows to prevent console window
+        startupinfo = None
+        creationflags = 0
+        if os.name == 'nt':  # Windows
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            creationflags = subprocess.CREATE_NO_WINDOW
+        
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        
+        # Poll for progress updates
+        last_progress_time = time.time()
+        poll_interval = 0.5  # seconds
+        timeout_seconds = 7200  # 2 hours max
+        
+        while process.poll() is None and is_processing:
+            # Check for timeout
+            if time.time() - batch_start_time > timeout_seconds:
+                process.terminate()
+                return False, "Processing timed out after 2 hours."
+            
+            # Read progress
+            progress_data = read_subprocess_progress(progress_file)
+            if progress_data:
+                batch_current_stage = progress_data.get('description', 'Processing...')
+                batch_processed_count = progress_data.get('batch_processed', 0)
+                batch_total_count = progress_data.get('batch_total', batch_total_count)
+                
+                # Update Gradio progress if available
+                if progress is not None:
+                    progress_percent = progress_data.get('progress_percent', 0) / 100
+                    try:
+                        progress(progress_percent, desc=batch_current_stage)
+                    except:
+                        pass
+                
+                last_progress_time = time.time()
+            
+            time.sleep(poll_interval)
+        
+        # Check if cancelled
+        if not is_processing:
+            process.terminate()
+            cleanup_subprocess_files(params_file, progress_file, results_file)
+            return False, "Processing was cancelled."
+        
+        # Wait for process to complete
+        stdout, stderr = process.communicate(timeout=60)
+        
+        if process.returncode != 0:
+            error_msg = stderr.decode('utf-8', errors='replace') if stderr else "Unknown error"
+            print(f"Subprocess error: {error_msg}")
+            cleanup_subprocess_files(params_file, progress_file, results_file)
+            return False, f"Subprocess failed: {error_msg[:500]}"
+        
+        # Read results
+        results = read_subprocess_results(results_file)
+        
+        if results is None:
+            cleanup_subprocess_files(params_file, progress_file, results_file)
+            return False, "Failed to read results from subprocess."
+        
+        if not results.get('success', False):
+            error_msg = results.get('error', 'Unknown error')
+            cleanup_subprocess_files(params_file, progress_file, results_file)
+            return False, f"Processing failed: {error_msg}"
+        
+        # Cleanup temp files
+        cleanup_subprocess_files(params_file, progress_file, results_file)
+        
+        return True, results
+        
+    except Exception as e:
+        traceback.print_exc()
+        cleanup_subprocess_files(params_file, progress_file, results_file)
+        return False, f"Exception during subprocess processing: {str(e)}"
+    finally:
+        is_processing = False
+        batch_total_count = 0
+        batch_processed_count = 0
+
+
+def run_single_in_subprocess(values_dict, progress=None):
+    """Run single image processing in a subprocess."""
+    global status_container
+    
+    input_image = values_dict.get('src_file')
+    if input_image is None:
+        return "No input image provided.", hide_batch_progress()
+    
+    # Check if it's a video (subprocess mode doesn't support video yet)
+    if is_video(input_image):
+        return "Video processing is not supported in subprocess mode. Please disable 'Auto Unload Models' for video processing.", hide_batch_progress()
+    
+    # Prepare parameters for subprocess
+    params = prepare_subprocess_params(values_dict, [input_image])
+    
+    # Launch subprocess
+    success, result = launch_subprocess_processing(params, progress)
+    
+    if not success:
+        return result, hide_batch_progress()
+    
+    # Process results
+    results_list = result.get('results', [])
+    total_processed = result.get('total_processed', 0)
+    
+    # Update status container with results
+    if results_list:
+        output_paths = [r['output_path'] for r in results_list if r.get('output_path')]
+        if output_paths:
+            # Create media data for the slider
+            media_data = MediaData(media_path=input_image)
+            media_data.outputs = output_paths
+            media_data.caption = results_list[0].get('caption', '')
+            status_container.image_data = [media_data]
+    
+    end_time = time.time()
+    return f"Processing completed (subprocess mode): {total_processed} image(s) processed.", hide_batch_progress()
+
+
+def run_batch_in_subprocess(values_dict, image_files, progress=None):
+    """Run batch image processing in a subprocess."""
+    global status_container
+    
+    if not image_files:
+        return "No images to process.", hide_batch_progress()
+    
+    # Prepare parameters for subprocess
+    params = prepare_subprocess_params(values_dict, image_files)
+    
+    # Launch subprocess
+    success, result = launch_subprocess_processing(params, progress)
+    
+    if not success:
+        return result, hide_batch_progress()
+    
+    # Process results
+    results_list = result.get('results', [])
+    total_processed = result.get('total_processed', 0)
+    
+    # Update status container with results
+    output_data = []
+    for res in results_list:
+        media_data = MediaData(media_path=res.get('input_path', ''))
+        media_data.outputs = [res.get('output_path')] if res.get('output_path') else []
+        media_data.caption = res.get('caption', '')
+        output_data.append(media_data)
+    
+    status_container.image_data = output_data
+    
+    return f"Batch processing completed (subprocess mode): {total_processed} image(s) processed.", hide_batch_progress()
+
+
+def prepare_subprocess_params(values_dict, image_paths):
+    """Prepare parameters dictionary for subprocess worker."""
+    # Copy values_dict and add additional parameters
+    params = dict(values_dict)
+    
+    # Add image paths
+    params['image_paths'] = image_paths
+    
+    # Add directory paths
+    params['ckpt_dir'] = args.ckpt_dir
+    params['lora_dir'] = args.lora_dir
+    
+    # Add runtime arguments that subprocess needs
+    params['loading_half_params'] = args.loading_half_params
+    params['fp8'] = args.fp8
+    params['fast_load_sd'] = args.fast_load_sd
+    params['use_tile_vae'] = args.use_tile_vae
+    params['use_fast_tile'] = args.use_fast_tile
+    params['encoder_tile_size'] = args.encoder_tile_size
+    params['decoder_tile_size'] = args.decoder_tile_size
+    params['load_8bit_llava'] = args.load_8bit_llava
+    params['load_4bit_llava'] = args.load_4bit_llava
+    
+    # Set outputs folder
+    if not params.get('outputs_folder') or len(params.get('outputs_folder', '')) < 2:
+        params['outputs_folder'] = args.outputs_folder
+    
+    # Remove non-serializable items
+    params.pop('src_file', None)
+    params.pop('batch_process_folder', None)
+    
+    # Ensure all values are JSON serializable
+    for key in list(params.keys()):
+        value = params[key]
+        if value is None:
+            continue
+        # Convert numpy types to Python types
+        if hasattr(value, 'item'):
+            params[key] = value.item()
+        elif not isinstance(value, (str, int, float, bool, list, dict, type(None))):
+            params[key] = str(value)
+    
+    return params
 
 
 def load_and_reset(param_setting):
@@ -2193,6 +3096,23 @@ def auto_enable_bg_restore(face_restore_enabled):
     """
     return gr.update(value=face_restore_enabled)
 
+def handle_face_only_toggle(face_only_enabled):
+    """
+    Handle mutual exclusivity between face-only and combined face+bg restoration.
+    When face-only is enabled, disable face and bg restoration.
+    """
+    if face_only_enabled:
+        return gr.update(value=False), gr.update(value=False)
+    return gr.update(), gr.update()
+
+def handle_face_restoration_toggle(face_enabled, face_only_enabled):
+    """
+    Handle face restoration toggle - disable face-only when face+bg is enabled.
+    """
+    if face_enabled and face_only_enabled:
+        return gr.update(value=False)
+    return gr.update()
+
 
 title_md = """
 # **SUPIR: Practicing Model Scaling for Photo-Realistic Image Restoration**
@@ -2240,6 +3160,54 @@ with open(compare_fullscreen_file) as f:
 head = f"""
 <style media="screen">{css}</style>
 <style media="screen">{slider_css}</style>
+<style media="screen">
+/* Force batch progress display to stay on top of ALL Gradio elements */
+#batch_progress_display {{
+    position: fixed !important;
+    z-index: 2147483647 !important;  /* Maximum possible z-index value */
+    pointer-events: none !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    filter: none !important;
+    backdrop-filter: none !important;
+}}
+
+/* Override any Gradio stacking contexts that might interfere */
+.gradio-container, .gradio-container * {{
+    z-index: auto !important;
+}}
+
+/* Prevent Gradio overlays from affecting our display */
+.gradio-overlay, .gr-overlay, .loading-overlay, .progress-overlay {{
+    z-index: 2147483646 !important;
+}}
+
+/* Prevent any dimming effects on our status display */
+#batch_progress_display * {{
+    opacity: 1 !important;
+    visibility: visible !important;
+    filter: none !important;
+}}
+
+/* Override any global overlay or dimming effects */
+body.gradio-loading #batch_progress_display,
+.gradio-container.loading #batch_progress_display {{
+    opacity: 1 !important;
+    visibility: visible !important;
+}}
+
+/* Simple fix for dropdown visibility in accordions */
+/* Allow overflow for accordion content to show dropdowns */
+details[open] > div:last-child {{
+    overflow: visible !important;
+}}
+
+/* Increase z-index for dropdown lists to appear above other elements */
+ul[role="listbox"],
+.choices__list--dropdown {{
+    z-index: 10000 !important;
+}}
+</style>
 <script type="text/javascript">{js}</script>
 <script type="text/javascript">{no_slider}</script>
 <script type="text/javascript">{compare_fullscreen_js}</script>
@@ -2283,6 +3251,27 @@ function downloadImage(sliderId) {{
         alert("Could not find the image source to download.");
     }}
 }}
+
+// Batch progress polling system
+function startBatchProgressPolling() {{
+    setInterval(function() {{
+        const updateBtn = document.getElementById('update_batch_progress_btn');
+        if (updateBtn) {{
+            updateBtn.click();
+        }}
+    }}, 2000); // Poll every 2 seconds
+}}
+
+
+// Start polling when page loads
+document.addEventListener('DOMContentLoaded', function() {{
+    startBatchProgressPolling();
+}});
+
+// Also start if DOM is already loaded
+if (document.readyState !== 'loading') {{
+    startBatchProgressPolling();
+}}
 </script>
 """
 
@@ -2323,7 +3312,19 @@ selected_pos, selected_neg, llava_style_prompt = select_style(
 block = gr.Blocks(title='SUPIR', theme=args.theme, css=css_file, head=head).queue()
 
 with (block):
-    gr.Markdown("SUPIR V75 - https://www.patreon.com/posts/99176057")
+    # START CHANGE: Move the batch progress HTML component to the top level.
+    # This escapes any nested CSS stacking contexts from tabs or columns,
+    # ensuring its high z-index is respected and it appears over Gradio's overlay.
+    batch_progress_html = gr.HTML(
+        value="",
+        visible=False,  # Start hidden. Processing functions will make it visible.
+        show_label=False,
+        elem_id="batch_progress_display"
+    )
+    
+    # END CHANGE
+
+    gr.Markdown("SUPIR V101 - https://www.patreon.com/posts/99176057")
     
     def do_nothing():
         pass
@@ -2335,12 +3336,22 @@ with (block):
                 start_single_button = gr.Button(value="Process Single")
                 start_batch_button = gr.Button(value="Process Batch")
                 stop_batch_button = gr.Button(value="Cancel")
+                auto_unload_models_checkbox = gr.Checkbox(
+                    label="Auto Unload Models", 
+                    value=False,
+                    info="Run in subprocess for full GPU memory cleanup after processing."
+                )
                 btn_open_outputs = gr.Button("Open Outputs Folder")
                 btn_open_outputs.click(fn=open_folder)
 
         with gr.Column(scale=1):
             with gr.Row():
                 output_label = gr.Label(label="Progress", elem_classes=["progress_label"])
+            with gr.Row():
+                # START CHANGE: The gr.HTML component is now defined at the top level.
+                # We only need the hidden button for polling here.
+                update_batch_progress_button = gr.Button(visible=False, elem_id="update_batch_progress_btn")
+                # END CHANGE
             with gr.Row():
                 target_res_textbox = gr.HTML(value="", visible=True, show_label=False)
         with gr.Row(equal_height=True):
@@ -2389,6 +3400,8 @@ with (block):
                     with gr.Row():
                         upscale_slider = gr.Slider(label="Upscale Size", minimum=1, maximum=20, value=1, step=0.1,
                                                   info="Base upscale factor. Image will be scaled by this amount, then constrained by Max Megapixels and Max Resolution if set. Set like 20x upscale and limit resolution with Max Megapixels and Max Resolution if you need.")
+                        first_downscale_checkbox = gr.Checkbox(label="First Downscale to Match Target Upscale Size", value=False,
+                                                             info="When enabled, the image is first downscaled using high-quality Lanczos algorithm to match the target resolution (after max megapixel/resolution constraints), then upscaled by the specified factor. This can help achieve more consistent results when working with size-constrained outputs.")
                     with gr.Row():
                         max_mp_slider = gr.Slider(label="Max Megapixels (0 = no limit)", minimum=0, maximum=100, value=0, step=1,
                                                  info="Limit output megapixels. Output will be constrained by Max Megapixels and Max Resolution if set. Note: Minimum dimension will always be at least 1024px.",
@@ -2455,6 +3468,15 @@ with (block):
                         btn_open_outputs = gr.Button("Open Outputs Folder")
                         btn_open_outputs.click(fn=open_folder)
                     with gr.Row():
+                        filename_prefix_textbox = gr.Textbox(
+                            label="Filename Prefix",
+                            placeholder="e.g., upscaled_",
+                            value="")
+                        filename_suffix_textbox = gr.Textbox(
+                            label="Filename Suffix (before extension)",
+                            placeholder="e.g., _hq",
+                            value="")
+                    with gr.Row():
                         with gr.Column():
                             batch_process_folder_textbox = gr.Textbox(
                                 label="Batch Input Folder - Can use image captions from .txt",
@@ -2462,8 +3484,10 @@ with (block):
                             outputs_folder_textbox = gr.Textbox(
                                 label="Batch Output Path - Leave empty to save to default.",
                                 placeholder="R:\SUPIR video\comparison_images\outputs")
-                            save_captions_checkbox = gr.Checkbox(label="Save Captions",
-                                                                 value=True)
+                            with gr.Row():
+                                save_captions_checkbox = gr.Checkbox(label="Save Captions",
+                                                                     value=True)
+                                skip_existing_images_checkbox = gr.Checkbox(label="Skip already upscaled images in target folder", value=True) # Default to True to avoid re-processing
 
                 with gr.Accordion("SUPIR options", open=False):
                     with gr.Row():
@@ -2532,10 +3556,56 @@ with (block):
                                                        step=32)
                     with gr.Row():
                         with gr.Column():
-                            apply_bg_checkbox = gr.Checkbox(label="BG restoration", value=False, visible=False)
-                        with gr.Column():
                             apply_face_checkbox = gr.Checkbox(label="Face restoration", value=False)
+                        with gr.Column():
+                            apply_face_only_checkbox = gr.Checkbox(label="Only Face Restoration", value=False)
+                    apply_bg_checkbox = gr.Checkbox(label="BG restoration", value=False, visible=False)
 
+                with gr.Accordion("LoRA Settings", open=False):
+                    gr.Markdown(f"Configure up to 4 LoRAs with individual weights. Place your LoRA files in the `{args.lora_dir}` folder.")
+
+                    lora_dropdowns = []
+                    lora_weight_sliders = []
+
+                    for i in range(1, 5):
+                        with gr.Row():
+                            lora_dropdown = gr.Dropdown(
+                                label=f"LoRA {i}",
+                                choices=list_loras(),
+                                value="None",
+                                interactive=True,
+                                scale=3
+                            )
+                            lora_weight = gr.Slider(
+                                label=f"Weight {i}",
+                                minimum=0.01,
+                                maximum=9.9,
+                                value=1.0,
+                                step=0.01,
+                                interactive=True,
+                                scale=1
+                            )
+                            lora_dropdowns.append(lora_dropdown)
+                            lora_weight_sliders.append(lora_weight)
+
+                    # Place refresh button and cache option below all LoRA options
+                    with gr.Row():
+                        refresh_loras_button = gr.Button("🔄 Refresh LoRA List", variant="secondary", scale=2)
+                        cache_base_model_checkbox = gr.Checkbox(
+                            label="Fast LoRA Switch (Keep base in RAM)",
+                            value=False,
+                            info="Uses more RAM but allows instant LoRA switching without model reload",
+                            scale=3
+                        )
+
+                    def refresh_lora_list():
+                        lora_choices = list_loras()
+                        return [gr.update(choices=lora_choices) for _ in range(4)]
+
+                    refresh_loras_button.click(
+                        fn=refresh_lora_list,
+                        outputs=lora_dropdowns
+                    )
 
                 with gr.Accordion("Presets", open=True):
                     presets_dir = os.path.join(os.path.dirname(__file__), 'presets')
@@ -2573,13 +3643,41 @@ with (block):
                             print(f"Error loading preset: {str(e)}")
                             return [f"Error loading preset: {str(e)}"] + [gr.update() for _ in range(len(elements_dict) + len(extra_info_elements))]
 
+                        # Define default values for elements that should be reset when missing from preset
+                        # This ensures checkboxes and other elements have consistent behavior
+                        element_defaults = {
+                            "auto_unload_models": False,
+                            "auto_unload_llava": False,
+                            "apply_llava": False,
+                            "apply_supir": True,
+                            "apply_face": False,
+                            "apply_face_only": False,
+                            "apply_bg": False,
+                            "random_seed": True,
+                            "save_captions": True,
+                            "make_comparison_video": False,
+                            "linear_CFG": True,
+                            "linear_s_stage2": False,
+                            "first_downscale": False,
+                            "skip_llava_if_txt_exists": True,
+                            "skip_existing_images": True,
+                            "cache_base_model": False,
+                        }
+
                         # Create default updates (no change) for all elements
                         all_updates = []
-                        all_updates.append(gr.update(value=f"Loaded preset: {preset_name}"))  # First update is the output message
+                        # Clear the message after a short delay instead of keeping it permanent
+                        all_updates.append(gr.update(value=""))  # First update is the output message
                         
-                        # Add updates for elements_dict
-                        for _ in elements_dict:
-                            all_updates.append(gr.update())
+                        # Add updates for elements_dict - use defaults for missing keys
+                        for key in elements_dict.keys():
+                            if key in config:
+                                all_updates.append(gr.update())  # Will be set below
+                            elif key in element_defaults:
+                                # Use default value for missing keys that have defaults defined
+                                all_updates.append(gr.update(value=element_defaults[key]))
+                            else:
+                                all_updates.append(gr.update())  # No change for other elements
                         
                         # Add updates for extra_info_elements
                         for _ in extra_info_elements:
@@ -2637,6 +3735,9 @@ with (block):
                         for e_key, element_index in zip(elements_dict.keys(), range(len(ui_elements))):
                             element = ui_elements[element_index]
                             last_index = element_index 
+                            # Check if element should be excluded from config saving
+                            if getattr(element, 'do_not_save_to_config', False):
+                                continue
                             # Check if the element has a 'value' attribute, otherwise use it directly
                             if hasattr(element, 'value'):
                                 serialized_dict[e_key] = element.value
@@ -2649,6 +3750,9 @@ with (block):
                             # Check if the extra element has a 'value' attribute, otherwise use directly
                             element = ui_elements[last_index]
                             last_index=last_index+1
+                            # Check if element should be excluded from config saving
+                            if getattr(element, 'do_not_save_to_config', False):
+                                continue
                             if hasattr(element, 'value'):
                                 serialized_dict[extra_key] = element.value
                             else:
@@ -2849,9 +3953,11 @@ with (block):
         "ae_dtype": ae_dtype_radio,
         "apply_bg": apply_bg_checkbox,
         "apply_face": apply_face_checkbox,
+        "apply_face_only": apply_face_only_checkbox,
         "apply_llava": apply_llava_checkbox,
         "apply_supir": apply_supir_checkbox,
         "auto_unload_llava": auto_unload_llava_checkbox,
+        "auto_unload_models": auto_unload_models_checkbox,
         "batch_process_folder": batch_process_folder_textbox,
         "ckpt_select": ckpt_select_dropdown,
         "color_fix_type": color_fix_type_radio,
@@ -2859,6 +3965,9 @@ with (block):
         "edm_steps": edm_steps_slider,
         "face_prompt": face_prompt_textbox,
         "face_resolution": face_resolution_slider,
+        "filename_prefix": filename_prefix_textbox,
+        "filename_suffix": filename_suffix_textbox,
+        "first_downscale": first_downscale_checkbox,
         "linear_CFG": linear_cfg_checkbox,
         "linear_s_stage2": linear_s_stage2_checkbox,
         "main_prompt": prompt_textbox,
@@ -2885,6 +3994,7 @@ with (block):
         "spt_linear_CFG": spt_linear_cfg_slider,
         "spt_linear_s_stage2": spt_linear_s_stage2_slider,
         "skip_llava_if_txt_exists": skip_llava_if_txt_exists_checkbox, # Added new checkbox
+        "skip_existing_images": skip_existing_images_checkbox, # Added skip existing images checkbox
         "src_file": src_input_file,
         "temperature": temperature_slider,
         "top_p": top_p_slider,
@@ -2896,6 +4006,14 @@ with (block):
         "video_start": video_start_time_number,
         "video_width": video_width_textbox,
     }
+
+    # Add LoRA elements to elements_dict
+    for i, (lora_dropdown, lora_weight) in enumerate(zip(lora_dropdowns, lora_weight_sliders), 1):
+        elements_dict[f"lora_{i}"] = lora_dropdown
+        elements_dict[f"lora_{i}_weight"] = lora_weight
+
+    # Add cache checkbox to elements_dict
+    elements_dict["cache_base_model"] = cache_base_model_checkbox
 
     extra_info_elements = {
         "prompt_style": prompt_style_dropdown,
@@ -2911,11 +4029,22 @@ with (block):
 
     elements_extra = list(extra_info_elements.values())
 
-    start_single_button.click(fn=start_single_process, inputs=elements, outputs=output_label,
-                              show_progress=True, queue=True)
-    start_batch_button.click(fn=start_batch_process, inputs=elements, outputs=output_label,
-                             show_progress=True, queue=True)
-    stop_batch_button.click(fn=stop_batch_upscale, outputs=output_label, show_progress=True, queue=True)
+    # Batch progress update handler (triggered by JavaScript)
+    update_batch_progress_button.click(fn=show_batch_progress, outputs=batch_progress_html, 
+                                      show_progress=False, queue=False)
+    
+
+    # Clear previous messages first, then start processing
+    start_single_button.click(fn=clear_output_message, outputs=[output_label, batch_progress_html],
+                              show_progress=False, queue=True).then(
+        fn=start_single_process, inputs=elements, outputs=[output_label, batch_progress_html],
+        show_progress=True, queue=True)
+    
+    start_batch_button.click(fn=clear_output_message, outputs=[output_label, batch_progress_html],
+                             show_progress=False, queue=True).then(
+        fn=start_batch_process, inputs=elements, outputs=[output_label, batch_progress_html],
+        show_progress=True, queue=True)
+    stop_batch_button.click(fn=stop_batch_upscale, outputs=[output_label, batch_progress_html], show_progress=True, queue=True)
     reset_button.click(fn=load_and_reset, inputs=[param_setting_select],
                        outputs=[edm_steps_slider, s_cfg_slider, s_stage2_slider, s_stage1_slider, s_churn_slider,
                                 s_noise_slider, a_prompt_textbox, n_prompt_textbox,
@@ -2938,9 +4067,15 @@ with (block):
     # Auto-enable background restore when face restore is enabled
     apply_face_checkbox.change(fn=auto_enable_bg_restore, inputs=[apply_face_checkbox], outputs=[apply_bg_checkbox])
     
+    # Handle mutual exclusivity between face restoration modes
+    apply_face_only_checkbox.change(fn=handle_face_only_toggle, inputs=[apply_face_only_checkbox], outputs=[apply_face_checkbox, apply_bg_checkbox])
+    apply_face_checkbox.change(fn=handle_face_restoration_toggle, inputs=[apply_face_checkbox, apply_face_only_checkbox], outputs=[apply_face_only_checkbox])
+    
     submit_button.click(fn=submit_feedback, inputs=[event_id, fb_score, fb_text], outputs=[fb_text])
     upscale_slider.change(fn=update_target_resolution, inputs=[src_image_display, upscale_slider, max_mp_slider, max_res_slider],
                           outputs=[target_res_textbox])
+    first_downscale_checkbox.change(fn=update_target_resolution, inputs=[src_image_display, upscale_slider, max_mp_slider, max_res_slider],
+                                   outputs=[target_res_textbox])
     
     # Remove previous handlers that aren't working
     # Add new handlers with explicit update logic
@@ -3121,6 +4256,8 @@ with (block):
         # This targets the compare slider by default
         js="() => toggleSliderFullscreen('compare_slider', 'compare_preview_column', 'compare_fullscreen_button', 'compare_download_button')"
     )
+    
+    # Batch progress now integrated directly into Gradio progress descriptions
 
 if args.port is not None:  # Check if the --port argument is provided
     # Remove direct loading here as it won't work
